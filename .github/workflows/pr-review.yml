@@ -8,9 +8,9 @@ jobs:
   review:
     runs-on: ubuntu-latest
     permissions:
-      issues: write # Required to post comments
-      pull-requests: write # Recommended for PR-related actions
-      contents: read # Needed for checkout and diff
+      issues: write
+      pull-requests: write
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -48,15 +48,90 @@ jobs:
       - name: Run Code Review
         run: python review_pr.py --github > review.md
 
-      - name: Post Review as PR Comment
+      - name: Debug Review Content
+        run: |
+          echo "Review content:"
+          cat review.md
+
+      - name: Post Review as PR Comments
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const review = fs.readFileSync('review.md', 'utf8');
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: review
-            });
+            console.log('Review content:', review); // Debug
+            const lines = review.split('\n');
+            let currentLineNumber = null;
+            let currentComment = '';
+            let currentSnippet = '';
+            let inSnippet = false;
+            // Assume App.js for simplicity; adjust dynamically if needed
+            const filePath = 'App.js';
+
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i].trim();
+              console.log(`Processing line ${i}:`, line); // Debug
+              if (line.match(/^\*\*Line (\d+):\*\*$/)) {
+                if (currentLineNumber && currentComment) {
+                  console.log(`Posting comment for line ${currentLineNumber}:`, currentComment);
+                  try {
+                    await github.rest.pulls.createReviewComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      pull_number: context.issue.number,
+                      body: `${currentSnippet}\n\n${currentComment}\n\n**Resolve:** Mark as resolved in GitHub UI`,
+                      commit_id: context.payload.pull_request.head.sha,
+                      path: filePath,
+                      line: currentLineNumber
+                    });
+                  } catch (e) {
+                    console.error('Error posting comment:', e);
+                    throw e;
+                  }
+                }
+                currentLineNumber = parseInt(line.match(/^\*\*Line (\d+):\*\*$/)[1]);
+                currentComment = '';
+                currentSnippet = '';
+                inSnippet = false;
+              } else if (line === '```diff') {
+                inSnippet = true;
+                currentSnippet = line + '\n';
+              } else if (line === '```' && inSnippet) {
+                inSnippet = false;
+                currentSnippet += line + '\n';
+              } else if (inSnippet) {
+                currentSnippet += line + '\n';
+              } else if (line.startsWith('**Comment:** ')) {
+                currentComment = line.replace('**Comment:** ', '');
+              }
+            }
+            // Post the last comment
+            if (currentLineNumber && currentComment) {
+              console.log(`Posting final comment for line ${currentLineNumber}:`, currentComment);
+              try {
+                await github.rest.pulls.createReviewComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.issue.number,
+                  body: `${currentSnippet}\n\n${currentComment}\n\n**Resolve:** Mark as resolved in GitHub UI`,
+                  commit_id: context.payload.pull_request.head.sha,
+                  path: filePath,
+                  line: currentLineNumber
+                });
+              } catch (e) {
+                console.error('Error posting final comment:', e);
+                throw e;
+              }
+            }
+            // Post general review summary
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: review
+              });
+            } catch (e) {
+              console.error('Error posting summary comment:', e);
+              throw e;
+            }
