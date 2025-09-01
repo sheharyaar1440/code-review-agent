@@ -16,6 +16,7 @@ function App() {
   }
   function handleClose() {
     setIsOpen(!isOpen);
+    console.log("ahjdkhfas");
   }
 
   return (
