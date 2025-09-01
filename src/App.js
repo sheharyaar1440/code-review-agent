@@ -4,6 +4,7 @@ const messages = [
   "Learn React ⚛️",
   "Apply for jobs 💼",
   "Invest your new income 🤑",
+  "some Other thing",
 ];
 function App() {
   const [step, setStep] = useState(1);
