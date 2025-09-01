@@ -7,6 +7,10 @@ on:
 jobs:
   review:
     runs-on: ubuntu-latest
+    permissions:
+      issues: write # Required to post comments
+      pull-requests: write # Recommended for PR-related actions
+      contents: read # Needed for checkout and diff
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
