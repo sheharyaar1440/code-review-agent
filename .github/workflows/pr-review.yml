@@ -8,9 +8,9 @@ jobs:
   review:
     runs-on: ubuntu-latest
     permissions:
-      issues: write # Required to post comments
-      pull-requests: write # Recommended for PR-related actions
-      contents: read # Needed for checkout and diff
+      issues: write
+      pull-requests: write
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -48,13 +48,64 @@ jobs:
       - name: Run Code Review
         run: python review_pr.py --github > review.md
 
-      - name: Post Review as PR Comment
+      - name: Post Review as PR Comments
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const review = fs.readFileSync('review.md', 'utf8');
-            github.rest.issues.createComment({
+            const lines = review.split('\n');
+            let currentLineNumber = null;
+            let currentComment = '';
+            let currentSnippet = '';
+            let inSnippet = false;
+            const diffFiles = process.env.PR_DIFF.split('\n\n'); // Split diff by file
+            const filePath = diffFiles.find(f => f.includes('App.js'))?.match(/--- a\/(.+)/)?.[1] || 'App.js';
+
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              if (line.match(/^\*\*Line (\d+):\*\*/)) {
+                if (currentLineNumber && currentComment) {
+                  await github.rest.pulls.createReviewComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: context.issue.number,
+                    body: `${currentSnippet}\n\n${currentComment}\n\n**Resolve:** Mark as resolved in GitHub UI`,
+                    commit_id: context.payload.pull_request.head.sha,
+                    path: filePath,
+                    line: currentLineNumber
+                  });
+                }
+                currentLineNumber = parseInt(line.match(/^\*\*Line (\d+):\*\*/)[1]);
+                currentComment = '';
+                currentSnippet = '';
+                inSnippet = false;
+              } else if (line === '```diff
+                inSnippet = true;
+                currentSnippet = line + '\n';
+              } else if (line === '```' && inSnippet) {
+                inSnippet = false;
+                currentSnippet += line + '\n';
+              } else if (inSnippet) {
+                currentSnippet += line + '\n';
+              } else if (line.startsWith('**Comment:** ')) {
+                currentComment = line.replace('**Comment:** ', '');
+              }
+            }
+            // Post the last comment
+            if (currentLineNumber && currentComment) {
+              await github.rest.pulls.createReviewComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                body: `${currentSnippet}\n\n${currentComment}\n\n**Resolve:** Mark as resolved in GitHub UI`,
+                commit_id: context.payload.pull_request.head.sha,
+                path: filePath,
+                line: currentLineNumber
+              });
+            }
+            // Post general review summary as a comment
+            await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
