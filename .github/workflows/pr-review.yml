@@ -40,20 +40,54 @@ jobs:
         id: get-diff
         run: |
           git fetch origin
-          DIFF=$(git diff origin/main...HEAD)
-          echo "PR_DIFF<<EOF" >> $GITHUB_ENV
-          echo "$DIFF" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+        DIFF=$(git diff origin/main...HEAD)
+         echo "PR_DIFF<<EOF" >> $GITHUB_ENV
+         echo "$DIFF" >> $GITHUB_ENV
+         echo "EOF" >> $GITHUB_ENV
 
-      - name: Run Code Review
-        run: python review_pr.py --github > review.md
-
-      - name: Debug Review Content
+         - name: Run Code Review
+        id: run-review
         run: |
-          echo "Review content:"
-          cat review.md
+          python review_pr.py --github > review.json
 
-      - name: Post Review as PR Comments
+      - name: Post Review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const review = JSON.parse(fs.readFileSync('review.json', 'utf8'));
+
+            const comments = [];
+
+            for (const item of review) {
+              if (!item.file || !item.line || !item.comment) continue;
+
+              comments.push({
+                path: item.file,
+                line: item.line,
+                side: "RIGHT",
+                body: item.comment
+              });
+            }
+
+            if (comments.length > 0) {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                event: "COMMENT",
+                comments
+              });
+            } else {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                body: "No actionable AI review comments found.",
+                event: "COMMENT"
+              });
+            }
+
         uses: actions/github-script@v7
         with:
           script: |

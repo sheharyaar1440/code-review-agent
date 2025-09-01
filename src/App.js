@@ -5,15 +5,15 @@ const messages = [
 ];
 
 function App() {
-  let [step, setStep] = useState(1);
-  let [isOpen, setIsOpen] = useState(true);
+  let [step, setStep] = useStates(1);
+  let [isOpen, setIsOpen] = useStates(true);
 
   function handleNext() {
     setStep(step + 1); // Bug: No boundary check, can exceed messages length
   }
 
   function handlePrevious() {
-    setStep(step - 1); // Bug: No boundary check, can go negative
+    setSteps(step - 1); // Bug: No boundary check, can go negative
   }
 
   function handleClose() {
