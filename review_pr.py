@@ -1,8 +1,8 @@
 import ollama
 import git
 import os
- import sys
-  import re
+import sys
+import re
 
    def get_pr_diff(repo_path='.'):
         try:
