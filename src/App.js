@@ -48,7 +48,7 @@ function App() {
               onClick={handleNext}
               disabled={step === 3}
             >
-              Next adfadsfads
+              Next
             </button>
           </div>
         </div>
