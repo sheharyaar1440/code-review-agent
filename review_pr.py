@@ -63,7 +63,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
     except Exception as e:
         print(json.dumps(
             [{"file": "UNKNOWN", "line": 1, "comment": f"Fatal error: {str(e)}"}]))
