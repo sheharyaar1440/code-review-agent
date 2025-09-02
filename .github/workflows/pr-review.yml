@@ -52,6 +52,61 @@ jobs:
       - name: Run Code Review
         run: python review_pr.py --github > review.json
 
+      - name: Post Inline Review Comments
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.issue.number;
+            const headSha = context.payload.pull_request.head.sha;
+
+            let review;
+            try {
+              review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
+            } catch (e) {
+              core.warning('Failed to parse review.json; skipping inline comments');
+              review = [];
+            }
+
+            if (!Array.isArray(review)) {
+              core.warning('review.json is not an array; skipping inline comments');
+              review = [];
+            }
+
+            const { data: files } = await github.rest.pulls.listFiles({ owner, repo, pull_number, per_page: 100 });
+            const changed = new Set(files.map(f => f.filename));
+
+            let posted = 0;
+            for (const item of review) {
+              const file = item.file;
+              const line = Number(item.line);
+              const body = String(item.comment || '').trim();
+
+              if (!file || !changed.has(file)) continue;
+              if (!Number.isInteger(line) || line <= 0) continue;
+              if (!body || body.toLowerCase().startsWith('fatal error:') || body.toLowerCase().startsWith('error:')) continue;
+
+              try {
+                await github.rest.pulls.createReviewComment({
+                  owner,
+                  repo,
+                  pull_number,
+                  commit_id: headSha,
+                  path: file,
+                  line,
+                  side: 'RIGHT',
+                  body
+                });
+                posted++;
+              } catch (e) {
+                core.warning(`Failed to post inline comment for ${file}:${line} - ${e.message}`);
+              }
+            }
+            core.info(`Posted ${posted} inline review comments.`);
+
       - name: Post Review Summary
         uses: actions/github-script@v7
         with:
