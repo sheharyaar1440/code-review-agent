@@ -77,7 +77,13 @@ jobs:
             }
 
             const { data: files } = await github.rest.pulls.listFiles({ owner, repo, pull_number, per_page: 100 });
-            const isReviewable = (p) => p && p.startsWith('src/') && ['.js','.jsx','.ts','.tsx'].some(ext => p.endsWith(ext));
+            const isReviewable = (p) => {
+              if (!p) return false;
+              const excludedPrefixes = ['.github/','.husky/','scripts/','config/','node_modules/','public/','__tests__/','.vscode/','.idea/','.git/'];
+              if (excludedPrefixes.some(pre => p.startsWith(pre))) return false;
+              const allowedExts = ['.js','.jsx','.ts','.tsx','.mjs','.cjs','.vue','.svelte','.py','.rb','.php','.go','.rs','.java','.kt','.kts','.scala','.cs','.cshtml','.vb','.fs','.swift','.c','.cc','.cxx','.cpp','.h','.hpp','.hh','.m','.mm','.sql','.ps1','.sh'];
+              return allowedExts.some(ext => p.endsWith(ext));
+            };
             const changed = new Set(files.map(f => f.filename).filter(isReviewable));
 
             let posted = 0;

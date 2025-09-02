@@ -17,7 +17,11 @@ def get_pr_diff(repo_path='.'):
 
 
 def is_reviewable_file(path: str) -> bool:
-    """Return True if the path should be reviewed (project source files only)."""
+    """Return True if the path should be reviewed (project source files only).
+
+    Framework-agnostic: supports many languages and does not require a specific directory,
+    but excludes well-known infra/config paths.
+    """
     if not isinstance(path, str):
         return False
     # Exclude config, scripts, and non-project areas
@@ -30,6 +34,8 @@ def is_reviewable_file(path: str) -> bool:
         'public/',
         '__tests__/',
         '.vscode/',
+        '.idea/',
+        '.git/',
     )
     if path.startswith(excluded_prefixes):
         return False
@@ -39,10 +45,14 @@ def is_reviewable_file(path: str) -> bool:
     )
     if any(path.endswith(name) for name in excluded_files):
         return False
-    # Only include typical project frontend files under src/
-    if not path.startswith('src/'):
-        return False
-    allowed_exts = ('.js', '.jsx', '.ts', '.tsx')
+    # Allowed language extensions (broad set)
+    allowed_exts = (
+        '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.vue', '.svelte',
+        '.py', '.rb', '.php', '.go', '.rs', '.java', '.kt', '.kts', '.scala',
+        '.cs', '.cshtml', '.vb', '.fs', '.swift',
+        '.c', '.cc', '.cxx', '.cpp', '.h', '.hpp', '.hh', '.m', '.mm',
+        '.sql', '.ps1', '.sh'
+    )
     return path.endswith(allowed_exts)
 
 
@@ -104,10 +114,10 @@ def parse_unified_diff(diff_text: str):
 
 
 def build_review_prompt(added_lines_by_file: dict) -> str:
-    """Construct a precise prompt instructing the model to comment only on added lines with exact file and line numbers."""
+    """Construct a precise, framework-agnostic prompt instructing the model to comment only on added lines with exact file and line numbers."""
     parts = []
     parts.append(
-        "You are an expert React and JavaScript code reviewer. Review ONLY the added lines below."
+        "You are an expert software code reviewer across languages and frameworks. Review ONLY the added lines below."
     )
     parts.append("For each issue, return a JSON array of objects of the form:")
     parts.append(
@@ -118,7 +128,7 @@ def build_review_prompt(added_lines_by_file: dict) -> str:
     parts.append(
         "- Keep comments concise and actionable; avoid restating the code.")
     parts.append(
-        "- Focus on correctness, React best practices, performance, security, and style.")
+        "- Focus on correctness, performance, security, maintainability, and style.")
     parts.append("")
     parts.append("Changed files and added lines:")
 
@@ -185,13 +195,92 @@ def filter_items_to_changed_lines(items, added_lines_by_file):
     return filtered
 
 
+def rule_based_review(file_path: str, added_lines: set[int]):
+    """Static checks on added lines for common React/JS issues.
+
+    Reads file content from disk and creates comments only for added lines.
+    """
+    results = []
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            src = f.read()
+    except Exception:
+        return results
+
+    lines = src.splitlines()
+
+    def add(line_no: int, msg: str):
+        if line_no in added_lines:
+            results.append(
+                {'file': file_path, 'line': line_no, 'comment': msg})
+
+    # Generic heuristics
+    for idx, text in enumerate(lines, start=1):
+        stripped = text.strip()
+
+        # TODO/FIXME
+        if re.search(r"\b(TODO|FIXME)\b", stripped, re.IGNORECASE):
+            add(idx, "Found TODO/FIXME. Resolve or track before merging.")
+
+        # Debug logging
+        if re.search(r"console\.(log|debug|trace)\(|System\.out\.println\(|Debug\.Write(Line)?\(|print\(", stripped):
+            add(idx, "Remove debug logging before commit or guard behind env flag.")
+
+        # Potential secret
+        if re.search(r"(API|SECRET|TOKEN|KEY)\s*[:=]", stripped, re.IGNORECASE):
+            add(idx, "Potential secret in code. Use env vars or secret manager.")
+
+        # JS/TS strict equality
+        if file_path.endswith((".js", ".jsx", ".ts", ".tsx", ".vue")) and re.search(r"[^=!]==[^=]", stripped):
+            add(idx, "Use strict equality (===) in JS/TS to avoid coercion.")
+
+        # Async call without await/then (heuristic)
+        if re.search(r"\b(fetch|axios\.(get|post|put|delete))\(", stripped) and not re.search(r"await\s+|\.then\(", stripped):
+            add(idx, "Async call without await/then. Ensure promise is handled.")
+
+        # C# public fields (heuristic)
+        if file_path.endswith('.cs') and re.search(r"public\s+\w+\s+\w+\s*;", stripped):
+            add(idx, "Prefer properties (get/set) instead of public fields in C#.")
+
+        # C# string concatenation in loops (heuristic)
+        if file_path.endswith('.cs') and re.search(r"\+\=\s*\w+\s*\+", stripped):
+            add(idx, "Avoid string concatenation in loops; use StringBuilder in C#.")
+
+        # Vue inline handlers
+        if file_path.endswith('.vue') and re.search(r"@click=\"\w+\(\)\"", stripped):
+            add(idx, "Prefer extracting handlers and using modifiers in Vue for clarity.")
+
+        # TS any type
+        if file_path.endswith('.ts') and re.search(r":\s*any\b", stripped):
+            add(idx, "Avoid 'any' in TypeScript; use specific types or unknown.")
+
+    # Framework-specific checks removed to keep it generic
+
+    return results
+
+
 def review_code(diff):
     if not diff or diff.startswith("Error getting diff:"):
         return []
 
     added_lines_by_file = parse_unified_diff(diff)
-    prompt = build_review_prompt(added_lines_by_file)
+    # First, run rule-based checks for determinism
+    rule_based_items = []
+    for file_path, added_lines in added_lines_by_file.items():
+        if not added_lines:
+            continue
+        try:
+            file_items = rule_based_review(file_path, added_lines)
+            rule_based_items.extend(file_items)
+        except Exception:
+            # Ignore rule engine failures per file
+            continue
 
+    if rule_based_items:
+        return rule_based_items
+
+    # Fallback to LLM if rules found nothing
+    prompt = build_review_prompt(added_lines_by_file)
     try:
         client = ollama.Client(host='http://127.0.0.1:11434')
         response = client.generate(
@@ -200,7 +289,6 @@ def review_code(diff):
         items = extract_json_array(raw_text)
         return filter_items_to_changed_lines(items, added_lines_by_file)
     except Exception:
-        # If the model call fails, return empty so the workflow posts a summary only
         return []
 
 
