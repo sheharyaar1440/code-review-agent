@@ -41,6 +41,31 @@ def run_syntax_checks(file_path: str):
     return results
 
 
+def safe_extract_json(text: str):
+    """Extract and parse JSON array reliably from model output."""
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Try to isolate first JSON array
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        snippet = text[start:end+1]
+        try:
+            return json.loads(snippet)
+        except Exception:
+            # As a last resort, try to fix common JSON issues
+            fixed = re.sub(r"(\w+):", r'"\1":', snippet)  # unquoted keys
+            fixed = fixed.replace("'", '"')  # single → double quotes
+            try:
+                return json.loads(fixed)
+            except Exception:
+                return []
+    return []
+
+
 def review_code(diff):
     if not diff or diff.startswith("Error getting diff:"):
         return []
@@ -83,7 +108,9 @@ def review_code(diff):
             response = client.generate(
                 model='codellama:7b-instruct', prompt=prompt)
             raw_text = response.get("response", "")
-            items = extract_json_array(raw_text)
+            items = safe_extract_json(raw_text)
+
+            items = safe(raw_text)
             # filter only lines belonging to this file (LLM might over-report)
             filtered = [i for i in items if i.get("file") == file_path]
             final_results.extend(filtered)
