@@ -137,7 +137,7 @@ def build_review_prompt(added_lines_by_file: dict, added_text_by_file: dict) -> 
     parts.append(
         "- Keep comments concise and actionable; avoid restating the code.")
     parts.append(
-        "- Focus on correctness, performance, security, maintainability, and style.")
+        "- Focus on correctness,synatx error, logical erros, performance, security, maintainability, and style.")
     parts.append("")
     parts.append("Changed files and added lines (with code):")
 
