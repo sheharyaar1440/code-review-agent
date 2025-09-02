@@ -57,12 +57,15 @@ def is_reviewable_file(path: str) -> bool:
 
 
 def parse_unified_diff(diff_text: str):
-    """Parse a unified diff and return a mapping of file -> set of new line numbers that were added.
+    """Parse a unified diff and return:
+    - added_lines_by_file: mapping of file -> set of new line numbers that were added
+    - added_text_by_file: mapping of file -> dict[new_line_number] = added line text
 
-    Only tracks added lines ('+' lines) and their new-file line numbers from each hunk.
+    Tracks added lines ('+' lines) and their new-file line numbers from each hunk.
     """
     file_path = None
     added_lines_by_file = {}
+    added_text_by_file = {}
     new_line_number = None
 
     # Patterns
@@ -80,6 +83,8 @@ def parse_unified_diff(diff_text: str):
                 file_path = candidate_path
                 if file_path not in added_lines_by_file:
                     added_lines_by_file[file_path] = set()
+                if file_path not in added_text_by_file:
+                    added_text_by_file[file_path] = {}
             else:
                 file_path = None
             new_line_number = None
@@ -102,6 +107,10 @@ def parse_unified_diff(diff_text: str):
         if line.startswith('+') and not line.startswith('+++'):
             # Added line in the new file
             added_lines_by_file[file_path].add(new_line_number)
+            try:
+                added_text_by_file[file_path][new_line_number] = line[1:]
+            except Exception:
+                pass
             new_line_number += 1
         elif line.startswith('-') and not line.startswith('---'):
             # Removed line; does not advance new file line number
@@ -110,11 +119,11 @@ def parse_unified_diff(diff_text: str):
             # Context line
             new_line_number += 1
 
-    return added_lines_by_file
+    return added_lines_by_file, added_text_by_file
 
 
-def build_review_prompt(added_lines_by_file: dict) -> str:
-    """Construct a precise, framework-agnostic prompt instructing the model to comment only on added lines with exact file and line numbers."""
+def build_review_prompt(added_lines_by_file: dict, added_text_by_file: dict) -> str:
+    """Construct a precise, framework-agnostic prompt with code snippets of added lines."""
     parts = []
     parts.append(
         "You are an expert software code reviewer across languages and frameworks. Review ONLY the added lines below."
@@ -130,13 +139,18 @@ def build_review_prompt(added_lines_by_file: dict) -> str:
     parts.append(
         "- Focus on correctness, performance, security, maintainability, and style.")
     parts.append("")
-    parts.append("Changed files and added lines:")
+    parts.append("Changed files and added lines (with code):")
 
     for file_path, line_numbers in added_lines_by_file.items():
         if not line_numbers:
             continue
-        sorted_lines = sorted(line_numbers)
-        parts.append(f"- {file_path}: added lines {sorted_lines}")
+        parts.append(f"File: {file_path}")
+        for ln in sorted(line_numbers):
+            code = added_text_by_file.get(file_path, {}).get(ln, '')
+            # Trim overly long lines for prompt safety
+            if len(code) > 400:
+                code = code[:400] + ' …'
+            parts.append(f"- line {ln}: {code}")
 
     parts.append("")
     parts.append(
@@ -263,7 +277,7 @@ def review_code(diff):
     if not diff or diff.startswith("Error getting diff:"):
         return []
 
-    added_lines_by_file = parse_unified_diff(diff)
+    added_lines_by_file, added_text_by_file = parse_unified_diff(diff)
     # First, run rule-based checks for determinism
     rule_based_items = []
     for file_path, added_lines in added_lines_by_file.items():
@@ -280,7 +294,7 @@ def review_code(diff):
         return rule_based_items
 
     # Fallback to LLM if rules found nothing
-    prompt = build_review_prompt(added_lines_by_file)
+    prompt = build_review_prompt(added_lines_by_file, added_text_by_file)
     try:
         client = ollama.Client(host='http://127.0.0.1:11434')
         response = client.generate(
