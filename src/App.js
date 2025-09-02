@@ -3,7 +3,6 @@ const messages = [
   "Apply for jobs 💼",
   "Invest your new income 🤑",
   "Some other value",
-  "asdfasdfasdf",
 ];
 
 function App() {

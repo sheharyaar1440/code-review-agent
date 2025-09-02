@@ -77,7 +77,8 @@ jobs:
             }
 
             const { data: files } = await github.rest.pulls.listFiles({ owner, repo, pull_number, per_page: 100 });
-            const changed = new Set(files.map(f => f.filename));
+            const isReviewable = (p) => p && p.startsWith('src/') && ['.js','.jsx','.ts','.tsx'].some(ext => p.endsWith(ext));
+            const changed = new Set(files.map(f => f.filename).filter(isReviewable));
 
             let posted = 0;
             for (const item of review) {

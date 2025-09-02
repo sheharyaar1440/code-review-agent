@@ -16,6 +16,36 @@ def get_pr_diff(repo_path='.'):
         return f"Error getting diff: {str(e)}"
 
 
+def is_reviewable_file(path: str) -> bool:
+    """Return True if the path should be reviewed (project source files only)."""
+    if not isinstance(path, str):
+        return False
+    # Exclude config, scripts, and non-project areas
+    excluded_prefixes = (
+        '.github/',
+        '.husky/',
+        'scripts/',
+        'config/',
+        'node_modules/',
+        'public/',
+        '__tests__/',
+        '.vscode/',
+    )
+    if path.startswith(excluded_prefixes):
+        return False
+    excluded_files = (
+        'review_pr.py',
+        'review.py',
+    )
+    if any(path.endswith(name) for name in excluded_files):
+        return False
+    # Only include typical project frontend files under src/
+    if not path.startswith('src/'):
+        return False
+    allowed_exts = ('.js', '.jsx', '.ts', '.tsx')
+    return path.endswith(allowed_exts)
+
+
 def parse_unified_diff(diff_text: str):
     """Parse a unified diff and return a mapping of file -> set of new line numbers that were added.
 
@@ -34,9 +64,14 @@ def parse_unified_diff(diff_text: str):
 
         file_match = diff_file_header.match(line)
         if file_match:
-            file_path = file_match.group(1)
-            if file_path not in added_lines_by_file:
-                added_lines_by_file[file_path] = set()
+            candidate_path = file_match.group(1)
+            # Only review eligible project files
+            if is_reviewable_file(candidate_path):
+                file_path = candidate_path
+                if file_path not in added_lines_by_file:
+                    added_lines_by_file[file_path] = set()
+            else:
+                file_path = None
             new_line_number = None
             continue
 
@@ -135,6 +170,8 @@ def filter_items_to_changed_lines(items, added_lines_by_file):
         if not file_path or not isinstance(file_path, str):
             continue
         if not comment:
+            continue
+        if not is_reviewable_file(file_path):
             continue
         if file_path not in added_lines_by_file:
             continue
