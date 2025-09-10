@@ -52,8 +52,6 @@ def run_syntax_checks(file_path: str):
                     "comment": f"Python compile failed: {str(py_e)}"
                 })
 
-        # Add more language integrations here if needed
-
     except Exception as e:
         # Log for debugging
         print(f"Syntax check error for {file_path}: {str(e)}")
@@ -74,7 +72,6 @@ def safe_extract_json(text: str):
     except Exception:
         pass
 
-    # Try to isolate first JSON array
     start = text.find("[")
     end = text.rfind("]")
     if start != -1 and end != -1 and end > start:
@@ -82,9 +79,8 @@ def safe_extract_json(text: str):
         try:
             return json.loads(snippet)
         except Exception:
-            # As a last resort, try to fix common JSON issues
-            fixed = re.sub(r"(\w+):", r'"\1":', snippet)  # unquoted keys
-            fixed = fixed.replace("'", '"')  # single → double quotes
+            fixed = re.sub(r"(\w+):", r'"\1":', snippet)
+            fixed = fixed.replace("'", '"')
             try:
                 return json.loads(fixed)
             except Exception:
@@ -97,7 +93,6 @@ def review_code(diff):
         return []
 
     added_lines_by_file, added_text_by_file = parse_unified_diff(diff)
-
     final_results = []
 
     for file_path, added_lines in added_lines_by_file.items():
@@ -109,7 +104,7 @@ def review_code(diff):
         rule_based_items = rule_based_review(file_path, added_lines)
         final_results.extend(rule_based_items)
 
-        # 3️⃣ Run LLM review (always, to catch logical/style issues)
+        # 3️⃣ Run LLM review
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 full_code = f.read()
@@ -165,4 +160,5 @@ def review_code(diff):
                 "comment": f"AI review failed: {str(e)}"
             })
 
+    save_review_results(final_results)
     return final_results
