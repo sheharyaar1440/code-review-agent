@@ -30,8 +30,12 @@ jobs:
       - name: Install and start Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh || { echo "Ollama install failed"; exit 1; }
+          if lsof -i :11434; then
+            echo "Port 11434 in use, attempting to free it..."
+            kill -9 $(lsof -t -i :11434) || { echo "Failed to kill process on port 11434"; exit 1; }
+          fi
           ollama serve &
-          sleep 30
+          sleep 60  # Increased for stability
           curl -sSf http://127.0.0.1:11434 || { echo "Ollama server not running"; exit 1; }
 
       - name: Pull Code Llama Model
@@ -55,7 +59,7 @@ jobs:
       - name: Debug Review Content
         run: |
           echo "Review content:"
-          cat review.json
+          cat review.json || echo "No review.json found"
 
       - name: Post Inline Review Comments
         uses: actions/github-script@v7

@@ -1,10 +1,10 @@
 import os
 import json
 import re
-import sys  # Added to fix NameError
+import sys
 from subprocess import run, PIPE
 import py_compile
-import git  # Required for local diff generation
+import git
 
 
 def parse_unified_diff(diff):
@@ -15,28 +15,32 @@ def parse_unified_diff(diff):
     current_lines = []
     current_text = []
 
-    for line in diff.split('\n'):
-        if line.startswith('diff --git'):
-            if current_file and current_lines:
-                added_lines_by_file[current_file] = current_lines
-                added_text_by_file[current_file] = '\n'.join(current_text)
-            current_file = line.split('b/')[-1]
-            current_lines = []
-            current_text = []
-        elif line.startswith('@@'):
-            match = re.match(r'@@ -(\d+),?\d* \+(\d+),?\d* @@', line)
-            if match:
-                current_line = int(match.group(2))
-        elif line.startswith('+') and not line.startswith('+++') and current_file:
-            current_lines.append(current_line)
-            current_text.append(line[1:])
-            current_line += 1
-        elif line.startswith(' ') and current_file:
-            current_line += 1
+    try:
+        for line in diff.split('\n'):
+            if line.startswith('diff --git'):
+                if current_file and current_lines:
+                    added_lines_by_file[current_file] = current_lines
+                    added_text_by_file[current_file] = '\n'.join(current_text)
+                current_file = line.split('b/')[-1]
+                current_lines = []
+                current_text = []
+            elif line.startswith('@@'):
+                match = re.match(r'@@ -(\d+),?\d* \+(\d+),?\d* @@', line)
+                if match:
+                    current_line = int(match.group(2))
+            elif line.startswith('+') and not line.startswith('+++') and current_file:
+                current_lines.append(current_line)
+                current_text.append(line[1:])
+                current_line += 1
+            elif line.startswith(' ') and current_file:
+                current_line += 1
 
-    if current_file and current_lines:
-        added_lines_by_file[current_file] = current_lines
-        added_text_by_file[current_file] = '\n'.join(current_text)
+        if current_file and current_lines:
+            added_lines_by_file[current_file] = current_lines
+            added_text_by_file[current_file] = '\n'.join(current_text)
+    except Exception as e:
+        print(f"Error parsing diff: {str(e)}")
+        return {}, {}
 
     return added_lines_by_file, added_text_by_file
 
@@ -124,29 +128,44 @@ def extract_snippet(diff, line_number, file_path):
     lines = diff.split('\n')
     snippet = []
     current_line = None
-    for i, line in enumerate(lines):
-        if line.startswith('@@'):
-            match = re.match(r'@@ -(\d+),?\d* \+(\d+),?\d* @@', line)
-            if match:
-                current_line = int(match.group(2))
-        elif line.startswith(('+', '-', ' ')) and current_line is not None:
-            if abs(current_line - line_number) <= 2:
-                snippet.append(line)
-            if line.startswith('+'):
-                if current_line == line_number:
-                    return '\n'.join(snippet)
-                current_line += 1
-            elif line.startswith(' '):
-                current_line += 1
+    try:
+        for i, line in enumerate(lines):
+            if line.startswith('@@'):
+                match = re.match(r'@@ -(\d+),?\d* \+(\d+),?\d* @@', line)
+                if match:
+                    current_line = int(match.group(2))
+            elif line.startswith(('+', '-', ' ')) and current_line is not None:
+                if abs(current_line - line_number) <= 2:
+                    snippet.append(line)
+                if line.startswith('+'):
+                    if current_line == line_number:
+                        return '\n'.join(snippet)
+                    current_line += 1
+                elif line.startswith(' '):
+                    current_line += 1
+    except Exception as e:
+        print(
+            f"Error extracting snippet for {file_path}:{line_number}: {str(e)}")
+        return f"No snippet found for line {line_number} in {file_path}."
     return '\n'.join(snippet) if snippet else f"No snippet found for line {line_number} in {file_path}."
 
 
 def review_code(diff):
     if not diff or diff.startswith("Error"):
+        print("No valid diff provided.")
         return []
 
-    added_lines_by_file, added_text_by_file = parse_unified_diff(diff)
     final_results = []
+    added_lines_by_file, added_text_by_file = parse_unified_diff(diff)
+
+    if not added_lines_by_file:
+        print("No files with changes detected in diff.")
+        final_results.append({
+            "file": "unknown",
+            "line": 1,
+            "comment": "No files with changes detected.\n\n**Resolve:** Mark as resolved in GitHub UI"
+        })
+        return final_results
 
     for file_path, added_lines in added_lines_by_file.items():
         # 1️⃣ Run syntax/lint checks
@@ -193,6 +212,8 @@ def review_code(diff):
             response = client.generate(
                 model='codellama:7b-instruct', prompt=prompt)
             raw_text = response.get("response", "").strip()
+            # Debug
+            print(f"Raw LLM output for {file_path}: {raw_text[:200]}...")
 
             items = safe_extract_json(raw_text)
             for item in items:
@@ -231,10 +252,55 @@ def save_review_results(results):
     try:
         with open("review.json", "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
+        print("Successfully saved review.json")
     except Exception as e:
         print(f"Failed to save review.json: {str(e)}")
+        with open("review.json", "w", encoding="utf-8") as f:
+            json.dump([{
+                "file": "unknown",
+                "line": 1,
+                "comment": f"Failed to save review: {str(e)}\n\n**Resolve:** Mark as resolved in GitHub UI"
+            }], f, indent=2)
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == '--github':
-        diff = os.environ
+    try:
+        if len(sys.argv) > 1 and sys.argv[1] == '--github':
+            diff = os.environ.get('PR_DIFF', '')
+        else:
+            try:
+                repo = git.Repo('.')
+                diff = repo.git.diff('main')
+            except Exception as e:
+                print(f"Error getting diff: {str(e)}")
+                save_review_results([{
+                    "file": "unknown",
+                    "line": 1,
+                    "comment": f"Error getting diff: {str(e)}\n\n**Resolve:** Mark as resolved in GitHub UI"
+                }])
+                return
+    except Exception as e:
+        print(f"Error in main: {str(e)}")
+        save_review_results([{
+            "file": "unknown",
+            "line": 1,
+            "comment": f"Error in main: {str(e)}\n\n**Resolve:** Mark as resolved in GitHub UI"
+        }])
+        return
+
+    if not diff:
+        print("No changes detected.")
+        save_review_results([{
+            "file": "unknown",
+            "line": 1,
+            "comment": "No changes detected.\n\n**Resolve:** Mark as resolved in GitHub UI"
+        }])
+        return
+
+    results = review_code(diff)
+    save_review_results(results)
+    print(json.dumps(results, indent=2))
+
+
+if __name__ == '__main__':
+    main()
