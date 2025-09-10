@@ -1,8 +1,10 @@
 import os
 import json
 import re
+import sys  # Added to fix NameError
 from subprocess import run, PIPE
 import py_compile
+import git  # Required for local diff generation
 
 
 def parse_unified_diff(diff):
@@ -40,7 +42,7 @@ def parse_unified_diff(diff):
 
 
 def rule_based_review(file_path, added_lines):
-    """Placeholder for rule-based review (implement as needed)."""
+    """Placeholder for rule-based review."""
     return []
 
 
@@ -164,7 +166,7 @@ def review_code(diff):
             final_results.append({
                 "file": file_path,
                 "line": 1,
-                "comment": f"Failed to read file: {str(e)}"
+                "comment": f"Failed to read file: {str(e)}\n\n**Resolve:** Mark as resolved in GitHub UI"
             })
             continue
 
@@ -181,7 +183,8 @@ def review_code(diff):
             f"File: {file_path}\n\n"
             f"```{full_code}```\n\n"
             "Return ONLY a valid JSON array with no extra text. Each object must have: "
-            '{"file": "relative/path", "line": <line_number>, "comment": "specific suggestion"}'
+            '{"file": "relative/path", "line": <line_number>, "comment": "specific suggestion"}. '
+            "Ensure the response is valid JSON with double quotes and no markdown."
         )
 
         try:
@@ -198,7 +201,6 @@ def review_code(diff):
                         item["line"] = int(item["line"])
                     except ValueError:
                         item["line"] = 1
-                # Add snippet and resolve option
                 if item.get("file") == file_path and item.get("line"):
                     snippet = extract_snippet(diff, item["line"], file_path)
                     item["comment"] = (
@@ -235,18 +237,4 @@ def save_review_results(results):
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--github':
-        diff = os.environ.get('PR_DIFF', '')
-    else:
-        diff = parse_unified_diff(os.popen('git diff main').read())[0]
-
-    if not diff:
-        print("No changes detected.")
-        return
-
-    results = review_code(diff)
-    save_review_results(results)
-    print(json.dumps(results, indent=2))
-
-
-if __name__ == '__main__':
-    main()
+        diff = os.environ
