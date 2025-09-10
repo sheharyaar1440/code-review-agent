@@ -35,8 +35,16 @@ jobs:
             kill -9 $(lsof -t -i :11434) || { echo "Failed to kill process on port 11434"; exit 1; }
           fi
           ollama serve &
-          sleep 90
-          curl -sSf http://127.0.0.1:11434 || { echo "Ollama server not running"; exit 1; }
+          echo "Waiting for Ollama to start..."
+          for i in {1..30}; do
+            if curl -sSf http://127.0.0.1:11434 >/dev/null 2>&1; then
+              echo "Ollama is ready!"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 3
+          done
+          curl -sSf http://127.0.0.1:11434 || { echo "Ollama server not running after 90s"; exit 1; }
 
       - name: Pull Code Llama Model
         run: |
@@ -60,7 +68,7 @@ jobs:
 
       - name: Run Code Review
         run: python review_pr.py --github
-        timeout-minutes: 5
+        timeout-minutes: 8
         env:
           PR_DIFF: ${{ env.PR_DIFF }}
 

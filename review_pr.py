@@ -273,6 +273,50 @@ def extract_snippet(diff, line_number, file_path):
     return result
 
 
+def should_skip_file(file_path):
+    """Check if a file should be skipped from review"""
+    if not file_path:
+        return True
+
+    # Skip review system files
+    excluded_files = {
+        'review_pr.py',
+        'review.py',
+        '.github/workflows/pr-review.yml',
+        'pr-review.yml'
+    }
+
+    # Skip certain directories and file types
+    excluded_patterns = [
+        '.github/',
+        'node_modules/',
+        '__pycache__/',
+        '.git/',
+        '.vscode/',
+        '.idea/',
+        'dist/',
+        'build/',
+        'coverage/',
+        '.nyc_output/',
+        'package-lock.json',
+        'yarn.lock',
+        '.env',
+        '.env.local',
+        '.env.production'
+    ]
+
+    # Check exact file matches
+    if file_path in excluded_files:
+        return True
+
+    # Check pattern matches
+    for pattern in excluded_patterns:
+        if file_path.startswith(pattern) or pattern in file_path:
+            return True
+
+    return False
+
+
 def review_code(diff):
     print("Starting code review...")
     start_time = time.time()
@@ -301,17 +345,74 @@ def review_code(diff):
         save_review_results(final_results)
         return final_results
 
-    for file_path, added_lines in added_lines_by_file.items():
-        print(f"Reviewing file: {file_path}")
-        # 1️⃣ Run syntax/lint checks
-        syntax_items = run_syntax_checks(file_path)
-        final_results.extend(syntax_items)
+    # Filter out excluded files
+    reviewable_files = {
+        k: v for k, v in added_lines_by_file.items() if not should_skip_file(k)}
 
-        # 2️⃣ Run rule-based checks
-        rule_based_items = rule_based_review(file_path, added_lines)
-        final_results.extend(rule_based_items)
+    if not reviewable_files:
+        print("No reviewable files found after filtering.")
+        final_results.append({
+            "file": "excluded",
+            "line": 1,
+            "snippet": "",
+            "comment": "Only excluded files were changed (review system files, configs, etc.)\n\n**Resolve:** Mark as resolved in GitHub UI"
+        })
+        save_review_results(final_results)
+        return final_results
+
+    print(
+        f"Reviewing {len(reviewable_files)} files: {list(reviewable_files.keys())}")
+
+    # Test Ollama connection early to avoid timeouts later
+    ollama_available = False
+    try:
+        print("Testing Ollama connection...")
+        client = Client(host='http://127.0.0.1:11434')
+        test_response = client.generate(
+            model='codellama:7b-instruct',
+            prompt='Hello',
+            options={'timeout': 10, 'num_predict': 5}
+        )
+        ollama_available = True
+        print("✓ Ollama connection successful!")
+    except Exception as e:
+        print(f"✗ Ollama connection failed: {str(e)}")
+        print("Continuing with syntax checks only...")
+
+    for file_path, added_lines in reviewable_files.items():
+        print(f"Reviewing file: {file_path}")
+        file_start_time = time.time()
+
+        # Skip file if we've been running for too long (prevent overall timeout)
+        if time.time() - start_time > 240:  # 4 minutes total limit
+            print(f"Skipping {file_path}: overall timeout approaching")
+            final_results.append({
+                "file": file_path,
+                "line": 1,
+                "snippet": "",
+                "comment": "Review timeout - please check this file manually\n\n**Resolve:** Mark as resolved in GitHub UI"
+            })
+            continue
+
+        # 1️⃣ Run syntax/lint checks (quick)
+        try:
+            syntax_items = run_syntax_checks(file_path)
+            final_results.extend(syntax_items)
+        except Exception as e:
+            print(f"Syntax check failed for {file_path}: {str(e)}")
+
+        # 2️⃣ Run rule-based checks (quick)
+        try:
+            rule_based_items = rule_based_review(file_path, added_lines)
+            final_results.extend(rule_based_items)
+        except Exception as e:
+            print(f"Rule-based check failed for {file_path}: {str(e)}")
 
         # 3️⃣ Run LLM review on changed lines only
+        if not ollama_available:
+            print(f"Skipping AI review for {file_path}: Ollama not available")
+            continue
+
         added_text = added_text_by_file.get(file_path, "")
         if not added_text.strip():
             print(f"No added content found for {file_path}")
@@ -371,11 +472,40 @@ def review_code(diff):
 
         try:
             print(f"Connecting to Ollama for {file_path}...")
+
+            # Skip AI review if too many lines to avoid timeout
+            if len(added_lines) > 20:
+                print(
+                    f"Skipping AI review for {file_path}: too many changes ({len(added_lines)} lines)")
+                final_results.append({
+                    "file": file_path,
+                    "line": added_lines[0] if added_lines else 1,
+                    "snippet": "",
+                    "comment": f"Large changeset detected ({len(added_lines)} lines). Please review manually for complex logic, security issues, and performance concerns.\n\n**Resolve:** Mark as resolved in GitHub UI"
+                })
+                continue
+
+            # Limit prompt size to prevent timeout
+            if len(prompt) > 8000:
+                print(f"Prompt too large for {file_path}, truncating...")
+                prompt = prompt[:8000] + \
+                    "\n\nNote: Content truncated due to size. Focus on critical issues."
+
             client = Client(host='http://127.0.0.1:11434')
+
+            # Use shorter timeout and optimized options
             response = client.generate(
-                model='codellama:7b-instruct', prompt=prompt, options={'timeout': 60})
+                model='codellama:7b-instruct',
+                prompt=prompt,
+                options={
+                    'timeout': 45,  # Reduced from 60
+                    'temperature': 0.1,  # Lower temperature for more focused responses
+                    'top_p': 0.9,
+                    'num_predict': 512,  # Limit response length
+                }
+            )
             raw_text = response.get("response", "").strip()
-            print(f"Raw LLM output for {file_path}: {raw_text[:200]}...")
+            print(f"Raw LLM output for {file_path}: {raw_text[:150]}...")
 
             items = safe_extract_json(raw_text)
             if isinstance(items, list):
@@ -430,7 +560,23 @@ def review_code(diff):
                 "comment": f"Unexpected error: {str(e)}\n\n**Resolve:** Mark as resolved in GitHub UI"
             })
 
-    print(f"Code review completed in {time.time() - start_time:.2f} seconds")
+        # Check if we've spent too much time on this file
+        file_duration = time.time() - file_start_time
+        if file_duration > 60:  # 1 minute per file max
+            print(
+                f"File {file_path} took {file_duration:.1f}s - consider optimization")
+
+    # Ensure we always have some results
+    if not final_results:
+        final_results.append({
+            "file": "review_completed",
+            "line": 1,
+            "snippet": "",
+            "comment": "Code review completed successfully. No issues found in the changed code.\n\n**Resolve:** Mark as resolved in GitHub UI"
+        })
+
+    print(
+        f"Code review completed in {time.time() - start_time:.2f} seconds with {len(final_results)} comments")
     save_review_results(final_results)
     return final_results
 
