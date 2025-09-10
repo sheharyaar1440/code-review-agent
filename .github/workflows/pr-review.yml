@@ -2,22 +2,31 @@ name: AI PR Review
 
 on:
   pull_request:
-    branches:
-      - main
     types: [opened, synchronize, reopened]
 
 jobs:
   review:
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: write
-      contents: read
-      issues: write
+      issues: write # Required to post comments
+      pull-requests: write # Recommended for PR-related actions
+      contents: read # Needed for checkout and diff
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh || { echo "Ollama install failed"; exit 1; }
+          ollama serve &
+          sleep 30
+          curl http://127.0.0.1:11434 || { echo "Ollama server not running"; exit 1; }
+
+      - name: Pull Code Llama Model
+        run: |
+          ollama pull codellama:7b-instruct || { echo "Model pull failed"; exit 1; }
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,130 +36,27 @@ jobs:
       - name: Install dependencies
         run: pip install ollama gitpython
 
-      - name: Install and start Ollama
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh || { echo "Ollama install failed"; exit 1; }
-          if lsof -i :11434; then
-            echo "Port 11434 in use, attempting to free it..."
-            kill -9 $(lsof -t -i :11434) || { echo "Failed to kill process on port 11434"; exit 1; }
-          fi
-          ollama serve &
-          sleep 60  # Increased for stability
-          curl -sSf http://127.0.0.1:11434 || { echo "Ollama server not running"; exit 1; }
-
-      - name: Pull Code Llama Model
-        run: |
-          ollama pull codellama:7b-instruct || { echo "Model pull failed"; exit 1; }
-
       - name: Get PR Diff
         id: get-diff
         run: |
           git fetch origin
-          DIFF=$(git diff origin/${{ github.event.pull_request.base.ref }}...${{ github.sha }})
-          {
-            echo "PR_DIFF<<EOF"
-            echo "$DIFF"
-            echo "EOF"
-          } >> "$GITHUB_ENV"
+          DIFF=$(git diff origin/main...HEAD)
+          echo "PR_DIFF<<EOF" >> $GITHUB_ENV
+          echo "$DIFF" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
       - name: Run Code Review
-        run: python review_pr.py --github
+        run: python review_pr.py --github > review.md
 
-      - name: Debug Review Content
-        run: |
-          echo "Review content:"
-          cat review.json || echo "No review.json found"
-
-      - name: Post Inline Review Comments
+      - name: Post Review as PR Comment
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const path = require('path');
-            const core = require('@actions/core');
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const pull_number = context.issue.number;
-            const headSha = context.payload.pull_request.head.sha;
-
-            let review;
-            try {
-              review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
-            } catch (e) {
-              core.warning(`Failed to parse review.json: ${e.message}`);
-              review = [];
-            }
-
-            if (!Array.isArray(review)) {
-              core.warning('review.json is not an array; skipping inline comments');
-              review = [];
-            }
-
-            const { data: files } = await github.rest.pulls.listFiles({ owner, repo, pull_number, per_page: 100 });
-            const isReviewable = (p) => {
-              if (!p) return false;
-              const excludedPrefixes = ['.github/','.husky/','scripts/','config/','node_modules/','public/','__tests__/','.vscode/','.idea/','.git/'];
-              if (excludedPrefixes.some(pre => p.startsWith(pre))) return false;
-              const allowedExts = ['.js','.jsx','.ts','.tsx','.mjs','.cjs','.vue','.svelte','.py','.rb','.php','.go','.rs','.java','.kt','.kts','.scala','.cs','.cshtml','.vb','.fs','.swift','.c','.cc','.cxx','.cpp','.h','.hpp','.hh','.m','.mm','.sql','.ps1','.sh'];
-              return allowedExts.some(ext => p.endsWith(ext));
-            };
-            const changed = new Set(files.map(f => f.filename).filter(isReviewable));
-
-            let posted = 0;
-            for (const item of review) {
-              const file = item.file;
-              const line = Number(item.line);
-              const body = String(item.comment || '').trim();
-
-              if (!file || !changed.has(file)) continue;
-              if (!Number.isInteger(line) || line <= 0) continue;
-              if (!body || body.toLowerCase().startsWith('fatal error:') || body.toLowerCase().startsWith('error:')) continue;
-
-              try {
-                await github.rest.pulls.createReviewComment({
-                  owner,
-                  repo,
-                  pull_number,
-                  commit_id: headSha,
-                  path: file,
-                  line,
-                  side: 'RIGHT',
-                  body
-                });
-                posted++;
-              } catch (e) {
-                core.warning(`Failed to post inline comment for ${file}:${line} - ${e.message}`);
-              }
-            }
-            core.info(`Posted ${posted} inline review comments.`);
-
-      - name: Post Review Summary
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const core = require('@actions/core');
-            let body = '';
-            try {
-              const review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
-              if (Array.isArray(review) && review.length > 0) {
-                body += '### AI Review Findings\n\n';
-                for (const item of review) {
-                  const file = item.file || 'UNKNOWN';
-                  const line = item.line || 1;
-                  const comment = (item.comment || '').replace(/```diff\n[\s\S]*?\n```/, '').replace('\n\n**Resolve:** Mark as resolved in GitHub UI', '').trim();
-                  body += `- ${file}:${line} - ${comment}\n`;
-                }
-              } else {
-                body = 'No actionable AI review comments found.';
-              }
-            } catch (e) {
-              body = `AI review failed to produce valid JSON: ${e.message}`;
-            }
-            await github.rest.issues.createComment({
+            const review = fs.readFileSync('review.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body
+              body: review
             });
