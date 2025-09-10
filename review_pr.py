@@ -1,103 +1,110 @@
-import ollama
-import git
-import os
-import sys
-import re
-
-
-def get_pr_diff(repo_path='.'):
-    try:
-        repo = git.Repo(repo_path)
-        current_branch = repo.active_branch.name
-        # Adjust 'main' if needed
-        diff = repo.git.diff('main', current_branch)
-        return diff
-    except Exception as e:
-        return f"Error getting diff: {str(e)}"
-
-
-def extract_snippet(diff, line_number):
-    """Extract a code snippet around the given line number from the diff."""
-    lines = diff.split('\n')
-    snippet = []
-    for i, line in enumerate(lines):
-        # Look for diff headers like @@ -start,count +start,count @@
-        if line.startswith('@@'):
-            match = re.match(r'@@ -(\d+),?\d* \+(\d+),?\d* @@', line)
-            if match:
-                old_start, new_start = int(match.group(1)), int(match.group(2))
-                current_line = new_start
-        elif line.startswith(('+', '-', ' ')) and current_line is not None:
-            if abs(current_line -
-                   line_number) <= 2:  # Include 2 lines of context
-                snippet.append(line)
-            if line.startswith('+'):
-                if current_line == line_number:
-                    return '\n'.join(snippet)
-                current_line += 1
-            elif line.startswith(' '):
-                current_line += 1
-    return '\n'.join(snippet) if snippet else "Snippet not found."
-
-
 def review_code(diff):
-    if not diff:
-        return "No changes to review."
-    prompt = f"""
-         You are an expert React and JavaScript code reviewer. Review the following code changes (diff) for:
-         - JavaScript bugs (e.g., incorrect event handling, state management issues)
-         - React best practices (e.g., hooks usage, component structure)
-         - Code style (e.g., ESLint rules, consistent formatting)
-         - Performance issues (e.g., unnecessary re-renders, large state updates)
-         - Security risks (e.g., XSS vulnerabilities, improper prop handling)
-         - Suggestions for cleaner, more maintainable code
+    print("Starting code review...")
+    start_time = time.time()
+    if not diff or diff.startswith("Error"):
+        print("No valid diff provided.")
+        return [{
+            "file": "unknown",
+            "line": 1,
+            "comment": "No valid diff provided.\n\n**Resolve:** Mark as resolved in GitHub UI"
+        }]
 
-         Provide comments in a numbered list, with each comment including:
-         - The line number (e.g., Line 4)
-         - The issue type (e.g., Bug Fix, Code Style, Performance)
-         - A detailed description
+    final_results = []
+    added_lines_by_file, added_text_by_file = parse_unified_diff(diff)
 
-         Diff:
-         {diff}
-         """
-    try:
-        client = ollama.Client(host='http://127.0.0.1:11434')
-        response = client.generate(model='codellama:7b-instruct',
-                                   prompt=prompt)
-        review = response['response']
-        # Parse review and add snippets
-        formatted_review = ""
-        review_lines = review.split('\n')
-        for line in review_lines:
-            match = re.match(r'\* Line (\d+): (.*)', line)
-            if match:
-                line_number = int(match.group(1))
-                comment = match.group(2)
-                snippet = extract_snippet(diff, line_number)
-                formatted_review += f"**Line {line_number}:**\n"
-                formatted_review += f"```diff\n{snippet}\n```\n"
-                formatted_review += f"**Comment:** {comment}\n"
-                formatted_review += "**Resolve:** Mark as resolved in GitHub UI\n\n"
-            else:
-                formatted_review += line + "\n"
-        return formatted_review
-    except Exception as e:
-        return f"Error connecting to Ollama: {str(e)}"
+    if not added_lines_by_file:
+        print("No files with changes detected in diff.")
+        final_results.append({
+            "file": "unknown",
+            "line": 1,
+            "comment": "No files with changes detected.\n\n**Resolve:** Mark as resolved in GitHub UI"
+        })
+        print(
+            f"Code review completed in {time.time() - start_time:.2f} seconds")
+        return final_results
 
+    for file_path, added_lines in added_lines_by_file.items():
+        print(f"Reviewing file: {file_path}")
+        # 1️⃣ Run syntax/lint checks
+        syntax_items = run_syntax_checks(file_path)
+        final_results.extend(syntax_items)
 
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] == '--github':
-        diff = os.environ.get('PR_DIFF', get_pr_diff())
-    else:
-        diff = get_pr_diff()
+        # 2️⃣ Run rule-based checks
+        rule_based_items = rule_based_review(file_path, added_lines)
+        final_results.extend(rule_based_items)
 
-    if not diff:
-        print("No changes detected.")
-        return
+        # 3️⃣ Run LLM review
+        try:
+            print(f"Reading file {file_path}...")
+            with open(file_path, "r", encoding="utf-8") as f:
+                full_code = f.read()
+            if len(full_code) > 10000:
+                print(f"File {file_path} too large, truncating...")
+                full_code = full_code[:10000]
+        except Exception as e:
+            print(f"Failed to read {file_path}: {str(e)}")
+            final_results.append({
+                "file": file_path,
+                "line": 1,
+                "comment": f"Failed to read file: {str(e)}\n\n**Resolve:** Mark as resolved in GitHub UI"
+            })
+            continue
 
-    review = review_code(diff)
-    print("### AI Code Review\n" + review)
+        ext = os.path.splitext(file_path)[1]
+        language = "Python" if ext == ".py" else "JavaScript/React" if ext in (
+            ".js", ".jsx", ".ts", ".tsx") else "Unknown"
+        prompt = (
+            f"You are an expert {language} code reviewer. Review the following file for:\n"
+            "- Syntax errors\n"
+            "- Logical bugs (boundary conditions, off-by-one, wrong variables)\n"
+            "- Performance issues\n"
+            "- Security concerns (secrets, injection, unsafe code)\n"
+            "- Maintainability and readability\n\n"
+            f"File: {file_path}\n\n"
+            f"```{full_code}```\n\n"
+            "Return ONLY a valid JSON array with no extra text. Each object must have: "
+            '{"file": "relative/path", "line": <line_number>, "snippet": "<code snippet>", "comment": "specific suggestion"}. '
+            "Ensure the response is valid JSON with double quotes and no markdown."
+        )
 
+        try:
+            print(f"Connecting to Ollama for {file_path}...")
+            client = Client(host='http://127.0.0.1:11434')
+            response = client.generate(
+                model='codellama:7b-instruct', prompt=prompt, options={'timeout': 60})
+            raw_text = response.get("response", "").strip()
+            print(f"Raw LLM output for {file_path}: {raw_text[:200]}...")
 
-if __name__ == '__main__':
-    main()
+            items = safe_extract_json(raw_text)
+            for item in items:
+                if isinstance(item.get("line"), str):
+                    try:
+                        item["line"] = int(item["line"])
+                    except ValueError:
+                        item["line"] = 1
+                if item.get("file") == file_path and item.get("line"):
+                    snippet = extract_snippet(diff, item["line"], file_path)
+                    item["snippet"] = snippet  # Store snippet separately
+                    item["comment"] = item.get(
+                        "comment", "") + "\n\n**Resolve:** Mark as resolved in GitHub UI"
+                final_results.append(item)
+            if not items:
+                print(
+                    f"LLM produced empty/invalid JSON for {file_path}: {raw_text[:200]}...")
+                final_results.append({
+                    "file": file_path,
+                    "line": 1,
+                    "snippet": "",
+                    "comment": f"No specific AI comments generated.\n\n**Resolve:** Mark as resolved in GitHub UI"
+                })
+        except OllamaError as e:
+            print(f"LLM review failed for {file_path}: {str(e)}")
+            final_results.append({
+                "file": file_path,
+                "line": 1,
+                "snippet": "",
+                "comment": f"AI review failed: {str(e)}\n\n**Resolve:** Mark as resolved in GitHub UI"
+            })
+
+    print(f"Code review completed in {time.time() - start_time:.2f} seconds")
+    return final_results
