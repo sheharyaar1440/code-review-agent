@@ -1,7 +1,8 @@
 import React from "react";
 
-const test1 = () => {
-  const a;
+const test1kh = () => {
+  const a = 10;
+  a = 20;
   return <div>test</div>;
 };
 

@@ -50,7 +50,12 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Run Code Review
-        run: python review_pr.py --github > review.json
+        run: python review_pr.py --github
+
+      - name: Debug Review Content
+        run: |
+          echo "Review content:"
+          cat review.json
 
       - name: Post Inline Review Comments
         uses: actions/github-script@v7
@@ -58,6 +63,7 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
+            const core = require('@actions/core');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pull_number = context.issue.number;
@@ -67,7 +73,7 @@ jobs:
             try {
               review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
             } catch (e) {
-              core.warning('Failed to parse review.json; skipping inline comments');
+              core.warning(`Failed to parse review.json: ${e.message}`);
               review = [];
             }
 
@@ -120,22 +126,23 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
+            const core = require('@actions/core');
             let body = '';
             try {
               const review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
               if (Array.isArray(review) && review.length > 0) {
-                body += 'AI Review findings:\n\n';
+                body += '### AI Review Findings\n\n';
                 for (const item of review) {
                   const file = item.file || 'UNKNOWN';
                   const line = item.line || 1;
-                  const comment = item.comment || '';
+                  const comment = (item.comment || '').replace(/```diff\n[\s\S]*?\n```/, '').replace('\n\n**Resolve:** Mark as resolved in GitHub UI', '').trim();
                   body += `- ${file}:${line} - ${comment}\n`;
                 }
               } else {
                 body = 'No actionable AI review comments found.';
               }
             } catch (e) {
-              body = 'AI review failed to produce valid JSON.';
+              body = `AI review failed to produce valid JSON: ${e.message}`;
             }
             await github.rest.issues.createComment({
               owner: context.repo.owner,
