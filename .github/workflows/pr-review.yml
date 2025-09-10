@@ -124,26 +124,24 @@ jobs:
             let posted = 0;
             let failed = 0;
 
+            // Process each review comment
             for (const item of review) {
               const file = item.file;
               const line = Number(item.line);
               const snippet = item.snippet || "";
               let body = (item.comment || "").trim();
               
-              // Add diff context if available
-              if (snippet) {
-                body = `**Code Context:**\n\`\`\`diff\n${snippet}\n\`\`\`\n\n${body}`;
-              }
-
-              console.log(`Processing review item: ${file}:${line}`);
+              console.log(`Processing review item: ${file}:${line} - "${body.substring(0, 50)}..."`);
               
+              // Skip items that can't be posted as inline comments
               if (!file) {
                 console.log(`Skipping item: no file specified`);
                 continue;
               }
               
               if (!changed.has(file)) {
-                console.log(`Skipping ${file}: not in changed files`);
+                console.log(`Skipping ${file}: not in changed files list`);
+                console.log(`Available files: ${Array.from(changed).join(', ')}`);
                 continue;
               }
               
@@ -157,7 +155,13 @@ jobs:
                 continue;
               }
 
+              // Add diff context if available and not already formatted
+              if (snippet && !body.includes('Code Context:')) {
+                body = `**Code Context:**\n\`\`\`diff\n${snippet}\n\`\`\`\n\n${body}`;
+              }
+
               try {
+                console.log(`Attempting to post comment on ${file}:${line}`);
                 await github.rest.pulls.createReviewComment({
                   owner,
                   repo,
@@ -169,11 +173,17 @@ jobs:
                   body
                 });
                 posted++;
-                console.log(`Successfully posted comment for ${file}:${line}`);
+                console.log(`✅ Successfully posted inline comment for ${file}:${line}`);
               } catch (e) {
                 failed++;
-                console.error(`Failed to post inline comment for ${file}:${line} - ${e.message}`);
+                console.error(`❌ Failed to post inline comment for ${file}:${line} - ${e.message}`);
+                console.error(`Error details:`, e);
                 core.warning(`Failed to post inline comment for ${file}:${line} - ${e.message}`);
+                
+                // Try to understand why it failed
+                if (e.message.includes('line')) {
+                  console.log(`Line ${line} may not be part of the diff for ${file}`);
+                }
               }
             }
             core.info(`Posted ${posted} inline review comments, ${failed} failed.`);
@@ -184,27 +194,86 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
-            let body = '';
+
             try {
               const review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
+              
               if (Array.isArray(review) && review.length > 0) {
-                body += '### AI Review Findings\n\n';
-                for (const item of review) {
-                  const file = item.file || 'UNKNOWN';
-                  const line = item.line || 1;
-                  const comment = (item.comment || '').replace(/```diff\n[\s\S]*?\n```/, '').replace('\n\n**Resolve:** Mark as resolved in GitHub UI', '').trim();
-                  body += `- ${file}:${line} - ${comment}\n`;
+                // Count how many inline comments vs summary items
+                const inlineComments = review.filter(item => 
+                  item.file && 
+                  item.file !== 'unknown' && 
+                  item.file !== 'excluded' && 
+                  item.file !== 'review_completed' &&
+                  item.file !== 'ollama_connection' &&
+                  Number.isInteger(Number(item.line)) && 
+                  Number(item.line) > 0
+                );
+                
+                const summaryItems = review.filter(item => 
+                  !item.file || 
+                  item.file === 'unknown' || 
+                  item.file === 'excluded' || 
+                  item.file === 'review_completed' ||
+                  item.file === 'ollama_connection' ||
+                  !Number.isInteger(Number(item.line)) || 
+                  Number(item.line) <= 0
+                );
+                
+                console.log(`Found ${inlineComments.length} inline comments and ${summaryItems.length} summary items`);
+                
+                // Only post summary if there are summary items or if inline comments failed
+                if (summaryItems.length > 0) {
+                  let body = '### 🤖 AI Code Review Summary\n\n';
+                  
+                  if (inlineComments.length > 0) {
+                    body += `✅ Posted ${inlineComments.length} inline review comments on specific code lines.\n\n`;
+                  }
+                  
+                  if (summaryItems.length > 0) {
+                    body += '📋 **Additional Notes:**\n\n';
+                    for (const item of summaryItems) {
+                      const comment = (item.comment || '').replace(/---[\s\S]*$/, '').trim();
+                      body += `- ${comment}\n`;
+                    }
+                  }
+                  
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.issue.number,
+                    body
+                  });
+                } else if (inlineComments.length > 0) {
+                  // Just post a simple summary that inline comments were added
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.issue.number,
+                    body: `### 🤖 AI Code Review Complete\n\n✅ Posted ${inlineComments.length} inline review comments on specific lines of code. Please review each comment and mark as resolved when addressed.`
+                  });
+                } else {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.issue.number,
+                    body: '### 🤖 AI Code Review Complete\n\n✅ No issues found in the code changes.'
+                  });
                 }
               } else {
-                body = 'No actionable AI review comments found.';
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: '### 🤖 AI Code Review\n\n⚠️ No review comments were generated.'
+                });
               }
             } catch (e) {
-              core.warning(`AI review failed to produce valid JSON: ${e.message}`);
-              body = `AI review failed to produce valid JSON: ${e.message}`;
+              core.warning(`AI review summary failed: ${e.message}`);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `### 🤖 AI Code Review\n\n❌ Review failed: ${e.message}`
+              });
             }
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body
-            });

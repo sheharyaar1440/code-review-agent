@@ -109,62 +109,176 @@ def parse_unified_diff(diff):
 
 
 def rule_based_review(file_path, added_lines):
-    return []
+    """Run rule-based checks on specific lines"""
+    results = []
+
+    if not os.path.exists(file_path) or not added_lines:
+        return results
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        ext = os.path.splitext(file_path)[1]
+
+        for line_num in added_lines:
+            if line_num <= len(lines):
+                line_content = lines[line_num - 1].strip()
+                line_lower = line_content.lower()
+
+                # JavaScript/TypeScript specific checks
+                if ext in ('.js', '.jsx', '.ts', '.tsx'):
+                    # Check for console.log in production code
+                    if 'console.log' in line_content and 'src/' in file_path:
+                        results.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "snippet": "",
+                            "comment": "**Debug Code Detected**\n\n`console.log` statements should be removed before production.\n\nConsider using a proper logging library instead.\n\n---\n*Remove debug code before merging.*"
+                        })
+
+                    # Check for var usage
+                    if line_content.strip().startswith('var '):
+                        results.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "snippet": "",
+                            "comment": "**Use Modern JavaScript**\n\nPrefer `const` or `let` instead of `var` for better scoping.\n\n```javascript\nconst value = ...;\n// or\nlet value = ...;\n```"
+                        })
+
+                    # Check for == instead of ===
+                    if ' == ' in line_content and '===' not in line_content:
+                        results.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "snippet": "",
+                            "comment": "**Use Strict Equality**\n\nUse `===` instead of `==` for strict equality comparison.\n\n```javascript\nif (value === expected) {\n  // strict comparison\n}\n```"
+                        })
+
+                # Python specific checks
+                elif ext == '.py':
+                    # Check for print statements (potential debug code)
+                    if line_content.strip().startswith('print(') and 'test' not in file_path.lower():
+                        results.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "snippet": "",
+                            "comment": "**Debug Code Detected**\n\n`print()` statements should typically be replaced with proper logging.\n\n```python\nimport logging\nlogging.info('Your message here')\n```"
+                        })
+
+                    # Check for bare except clauses
+                    if line_content.strip() == 'except:':
+                        results.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "snippet": "",
+                            "comment": "**Avoid Bare Except**\n\nBare `except:` clauses catch all exceptions, including system exits.\n\n```python\ntry:\n    # code\nexcept SpecificException as e:\n    # handle specific exception\n```"
+                        })
+
+                # General checks for all files
+                # Check for TODO comments
+                if 'todo' in line_lower or 'fixme' in line_lower:
+                    results.append({
+                        "file": file_path,
+                        "line": line_num,
+                        "snippet": "",
+                        "comment": "**TODO/FIXME Found**\n\nConsider creating a GitHub issue to track this work item instead of leaving it in comments."
+                    })
+
+                # Check for very long lines
+                if len(line_content) > 120:
+                    results.append({
+                        "file": file_path,
+                        "line": line_num,
+                        "snippet": "",
+                        "comment": "**Line Too Long**\n\nThis line is over 120 characters. Consider breaking it into multiple lines for better readability."
+                    })
+
+    except Exception as e:
+        print(f"Rule-based review error for {file_path}: {str(e)}")
+
+    return results
 
 
-def run_syntax_checks(file_path: str):
+def run_syntax_checks(file_path: str, added_lines: list):
     print(f"Running syntax checks for {file_path}...")
     start_time = time.time()
     results = []
     ext = os.path.splitext(file_path)[1]
 
+    # Skip syntax checks if file doesn't exist
+    if not os.path.exists(file_path):
+        print(f"File {file_path} does not exist, skipping syntax checks")
+        return results
+
     try:
         if ext in (".js", ".jsx", ".ts", ".tsx"):
-            p = run(["eslint", "-f", "json", file_path],
-                    stdout=PIPE, stderr=PIPE, text=True, timeout=30)
-            if p.returncode != 0 or p.stdout.strip():
+            # Try to find eslint in node_modules or global
+            eslint_cmd = None
+            for cmd in ["npx eslint", "eslint", "./node_modules/.bin/eslint"]:
                 try:
-                    eslint_output = json.loads(p.stdout)
-                    for msg in eslint_output[0].get("messages", []):
-                        results.append({
-                            "file": file_path,
-                            "line": int(msg.get("line", 1)),
-                            "snippet": "",
-                            "comment": msg.get("message", "Lint issue")
-                        })
-                except json.JSONDecodeError:
-                    results.append({
-                        "file": file_path,
-                        "line": 1,
-                        "snippet": "",
-                        "comment": f"ESLint failed: {p.stderr.strip()}"
-                    })
+                    p = run(cmd.split() + ["--version"],
+                            stdout=PIPE, stderr=PIPE, timeout=5)
+                    if p.returncode == 0:
+                        eslint_cmd = cmd.split()
+                        break
+                except:
+                    continue
+
+            if eslint_cmd:
+                p = run(eslint_cmd + ["-f", "json", file_path],
+                        stdout=PIPE, stderr=PIPE, text=True, timeout=30)
+                if p.stdout.strip():
+                    try:
+                        eslint_output = json.loads(p.stdout)
+                        for file_result in eslint_output:
+                            for msg in file_result.get("messages", []):
+                                line_num = int(msg.get("line", 1))
+                                # Only report issues on lines that were actually changed
+                                if line_num in added_lines:
+                                    results.append({
+                                        "file": file_path,
+                                        "line": line_num,
+                                        "snippet": "",
+                                        "comment": f"**ESLint Issue**\n\n{msg.get('message', 'Lint issue')}\n\n**Rule:** `{msg.get('ruleId', 'unknown')}`\n\n---\n*Please fix this linting issue.*"
+                                    })
+                    except json.JSONDecodeError:
+                        pass
+            else:
+                print(
+                    f"ESLint not found, skipping JS/TS checks for {file_path}")
+
         elif ext == ".py":
             try:
                 py_compile.compile(file_path, doraise=True)
             except py_compile.PyCompileError as e:
-                line_msg = str(e).split(',')[0] if ',' in str(e) else "1"
-                results.append({
-                    "file": file_path,
-                    "line": int(line_msg.split()[-1]) if line_msg.isdigit() else 1,
-                    "snippet": "",
-                    "comment": f"Python syntax error: {str(e)}"
-                })
+                error_str = str(e)
+                # Extract line number from Python compile error
+                import re
+                line_match = re.search(r'line (\d+)', error_str)
+                if line_match:
+                    line_num = int(line_match.group(1))
+                    # Only report if the error is on a changed line
+                    if line_num in added_lines:
+                        results.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "snippet": "",
+                            "comment": f"**Python Syntax Error**\n\n{str(e)}\n\n---\n*Please fix this syntax error before proceeding.*"
+                        })
             except Exception as py_e:
-                results.append({
-                    "file": file_path,
-                    "line": 1,
-                    "snippet": "",
-                    "comment": f"Python compile failed: {str(py_e)}"
-                })
+                # Generic Python error, put on first changed line
+                if added_lines:
+                    results.append({
+                        "file": file_path,
+                        "line": added_lines[0],
+                        "snippet": "",
+                        "comment": f"**Python Error:** {str(py_e)}"
+                    })
     except Exception as e:
         print(f"Syntax check error for {file_path}: {str(e)}")
-        results.append({
-            "file": file_path,
-            "line": 1,
-            "snippet": "",
-            "comment": f"Syntax check failed: {str(e)}"
-        })
+        # Don't add generic errors that can't be tied to specific lines
+
     print(
         f"Syntax checks for {file_path} completed in {time.time() - start_time:.2f} seconds")
     return results
@@ -396,7 +510,7 @@ def review_code(diff):
 
         # 1️⃣ Run syntax/lint checks (quick)
         try:
-            syntax_items = run_syntax_checks(file_path)
+            syntax_items = run_syntax_checks(file_path, added_lines)
             final_results.extend(syntax_items)
         except Exception as e:
             print(f"Syntax check failed for {file_path}: {str(e)}")
@@ -531,14 +645,16 @@ def review_code(diff):
                         # Create a well-formatted review comment
                         comment = item.get("comment", "").strip()
                         if comment:
+                            # Format AI comments consistently
+                            formatted_comment = f"**AI Code Review**\n\n{comment}\n\n---\n*This comment was generated by AI. Please review and mark as resolved if addressed.*"
                             final_results.append({
                                 "file": file_path,
                                 "line": line_num,
                                 "snippet": snippet,
-                                "comment": comment + "\n\n**Resolve:** Mark as resolved in GitHub UI"
+                                "comment": formatted_comment
                             })
                             print(
-                                f"Added review comment for {file_path}:{line_num}")
+                                f"Added AI review comment for {file_path}:{line_num}")
 
             if not items:
                 print(
@@ -672,6 +788,16 @@ def main():
     for result in results:
         print(
             f"  - {result.get('file', 'unknown')}:{result.get('line', 1)} - {result.get('comment', '')[:100]}...")
+
+    # Additional debugging info
+    print(f"\nDetailed review results:")
+    for i, result in enumerate(results):
+        print(f"Comment {i+1}:")
+        print(f"  File: {result.get('file', 'N/A')}")
+        print(f"  Line: {result.get('line', 'N/A')}")
+        print(f"  Comment length: {len(result.get('comment', ''))}")
+        print(f"  Has snippet: {bool(result.get('snippet', ''))}")
+        print("---")
 
     save_review_results(results)
     print(json.dumps(results, indent=2))
