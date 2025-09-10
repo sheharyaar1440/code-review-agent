@@ -62,7 +62,6 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
-            const core = require('@actions/core');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pull_number = context.issue.number;
@@ -95,66 +94,27 @@ jobs:
             for (const item of review) {
               const file = item.file;
               const line = Number(item.line);
-              const body = String(item.comment || '').trim();
+              const snippet = item.snippet || "";
+              const body = (snippet ? `**Context:**\n\`\`\`diff\n${snippet}\n\`\`\`\n\n` : "") + (item.comment || "").trim();
 
               if (!file || !changed.has(file)) continue;
               if (!Number.isInteger(line) || line <= 0) continue;
               if (!body || body.toLowerCase().startsWith('fatal error:') || body.toLowerCase().startsWith('error:')) continue;
 
-              // Split the comment into individual line comments if it contains a diff snippet
-              const lines = body.split('\n');
-              let currentLine = line;
-              let commentBuffer = [];
-              for (const lineText of lines) {
-                if (lineText.startsWith('```diff
-                  // Skip the diff/suggestion block start
-                  continue;
-                } else if (lineText === '```') {
-                  // End of diff/suggestion block, post the buffered comment
-                  if (commentBuffer.length > 0) {
-                    try {
-                      await github.rest.pulls.createReviewComment({
-                        owner,
-                        repo,
-                        pull_number,
-                        commit_id: headSha,
-                        path: file,
-                        line: currentLine,
-                        side: 'RIGHT',
-                        body: commentBuffer.join('\n')
-                      });
-                      posted++;
-                    } catch (e) {
-                      core.warning(`Failed to post inline comment for ${file}:${currentLine} - ${e.message}`);
-                    }
-                    commentBuffer = [];
-                  }
-                } else if (lineText.startsWith('+') || lineText.startsWith('-') || lineText.startsWith(' ')) {
-                  // Skip diff lines, they are part of the context
-                  continue;
-                } else {
-                  // Accumulate comment text
-                  commentBuffer.push(lineText);
-                }
-              }
-
-              // Post any remaining buffered comment
-              if (commentBuffer.length > 0) {
-                try {
-                  await github.rest.pulls.createReviewComment({
-                    owner,
-                    repo,
-                    pull_number,
-                    commit_id: headSha,
-                    path: file,
-                    line: currentLine,
-                    side: 'RIGHT',
-                    body: commentBuffer.join('\n')
-                  });
-                  posted++;
-                } catch (e) {
-                  core.warning(`Failed to post inline comment for ${file}:${currentLine} - ${e.message}`);
-                }
+              try {
+                await github.rest.pulls.createReviewComment({
+                  owner,
+                  repo,
+                  pull_number,
+                  commit_id: headSha,
+                  path: file,
+                  line,
+                  side: 'RIGHT',
+                  body
+                });
+                posted++;
+              } catch (e) {
+                core.warning(`Failed to post inline comment for ${file}:${line} - ${e.message}`);
               }
             }
             core.info(`Posted ${posted} inline review comments.`);
@@ -165,7 +125,6 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
-            const core = require('@actions/core');
             let body = '';
             try {
               const review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
@@ -174,13 +133,14 @@ jobs:
                 for (const item of review) {
                   const file = item.file || 'UNKNOWN';
                   const line = item.line || 1;
-                  const comment = (item.comment || '').replace(/```diff
+                  const comment = (item.comment || '').replace(/```diff\n[\s\S]*?\n```/, '').replace('\n\n**Resolve:** Mark as resolved in GitHub UI', '').trim();
                   body += `- ${file}:${line} - ${comment}\n`;
                 }
               } else {
                 body = 'No actionable AI review comments found.';
               }
             } catch (e) {
+              core.warning(`AI review failed to produce valid JSON: ${e.message}`);
               body = `AI review failed to produce valid JSON: ${e.message}`;
             }
             await github.rest.issues.createComment({
