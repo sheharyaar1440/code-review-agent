@@ -8,9 +8,7 @@ const messages = [
 function App() {
   let [step, setStep] = useState(1);
   let [isOpen, setIsOpen] = useState(true);
-  const ca = 20;
-  ca = 40;
-  d = 40;
+  let a;
 
   function handleNext() {
     setStep(step + 1); // Bug: No boundary check, can exceed messages length

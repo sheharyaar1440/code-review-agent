@@ -6,7 +6,17 @@ from subprocess import run, PIPE
 import py_compile
 import git
 import time
-from ollama import Client, OllamaError
+try:
+    from ollama import Client
+    # Attempt to import OllamaError, fallback to Exception if not available
+    try:
+        from ollama import OllamaError
+    except ImportError:
+        OllamaError = Exception
+        print("Warning: OllamaError not found, using generic Exception as fallback")
+except ImportError:
+    print("Error: ollama package not found. Please install it with 'pip install ollama'")
+    sys.exit(1)
 
 
 def parse_unified_diff(diff):
@@ -306,7 +316,6 @@ def save_review_results(results):
     print("Saving review.json...")
     start_time = time.time()
     try:
-        # Ensure the file is saved in the current working directory
         with open("review.json", "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
         print(
