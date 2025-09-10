@@ -23,41 +23,88 @@ def parse_unified_diff(diff):
     start_time = time.time()
     added_lines_by_file = {}
     added_text_by_file = {}
+    file_changes = {}  # Track all changes per file
     current_file = None
     current_lines = []
     current_text = []
+    current_line = None
 
     try:
-        if len(diff) > 100000:
+        if len(diff) > 500000:  # Increased limit for larger diffs
             print("Diff too large, truncating...")
-            diff = diff[:100000]
-        print(f"Diff content (first 50 lines):\n{diff.split('\n')[:50]}")
+            diff = diff[:500000]
+
+        print(
+            f"Diff content (first 20 lines):\n{chr(10).join(diff.split(chr(10))[:20])}")
+
         for line in diff.split('\n'):
             if line.startswith('diff --git'):
+                # Save previous file changes
                 if current_file and current_lines:
-                    added_lines_by_file[current_file] = current_lines
+                    added_lines_by_file[current_file] = current_lines.copy()
                     added_text_by_file[current_file] = '\n'.join(current_text)
-                current_file = line.split('b/')[-1].strip()
+
+                # Parse new file path - handle both a/ and b/ prefixes
+                parts = line.split()
+                if len(parts) >= 4:
+                    # Extract from "diff --git a/path b/path"
+                    b_file = parts[3]
+                    if b_file.startswith('b/'):
+                        current_file = b_file[2:]
+                    else:
+                        current_file = b_file
+                else:
+                    current_file = None
+
                 current_lines = []
                 current_text = []
-            elif line.startswith('@@'):
-                match = re.match(r'@@ -(\d+),?\d* \+(\d+),?\d* @@', line)
+                current_line = None
+
+            elif line.startswith('+++'):
+                # Alternative way to get file path
+                if not current_file and 'b/' in line:
+                    current_file = line.split('b/')[-1].strip()
+
+            elif line.startswith('@@') and current_file:
+                # Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
+                match = re.match(r'@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@', line)
                 if match:
-                    current_line = int(match.group(2))
-            elif line.startswith('+') and not line.startswith('+++') and current_file:
-                current_lines.append(current_line)
-                current_text.append(line[1:])
-                current_line += 1
-            elif line.startswith(' ') and current_file:
-                current_line += 1
+                    new_start = int(match.group(3))
+                    current_line = new_start
+                    print(
+                        f"Found hunk for {current_file} starting at line {current_line}")
+
+            elif current_file and current_line is not None:
+                if line.startswith('+') and not line.startswith('+++'):
+                    # This is an added line
+                    current_lines.append(current_line)
+                    current_text.append(line[1:])  # Remove the '+' prefix
+                    print(
+                        f"Added line {current_line} in {current_file}: {line[1:].strip()[:50]}...")
+                    current_line += 1
+                elif line.startswith(' '):
+                    # Context line - increment line number but don't save
+                    current_line += 1
+                elif line.startswith('-'):
+                    # Deleted line - don't increment new line number
+                    pass
+
+        # Save the last file
         if current_file and current_lines:
             added_lines_by_file[current_file] = current_lines
             added_text_by_file[current_file] = '\n'.join(current_text)
+
     except Exception as e:
         print(f"Error parsing diff: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {}, {}
-    print(
-        f"Diff parsing completed in {time.time() - start_time:.2f} seconds with {len(added_lines_by_file)} files")
+
+    print(f"Diff parsing completed in {time.time() - start_time:.2f} seconds")
+    print(f"Found changes in {len(added_lines_by_file)} files:")
+    for file_path, lines in added_lines_by_file.items():
+        print(f"  {file_path}: {len(lines)} added lines")
+
     return added_lines_by_file, added_text_by_file
 
 
@@ -159,33 +206,71 @@ def safe_extract_json(text: str):
 def extract_snippet(diff, line_number, file_path):
     print(f"Extracting snippet for {file_path}:{line_number}...")
     start_time = time.time()
+
+    if not diff or not file_path:
+        return ""
+
     lines = diff.split('\n')
     snippet = []
     current_line = None
+    in_target_file = False
+    context_window = 3  # Lines of context before and after
+
     try:
         for i, line in enumerate(lines):
+            # Check if we're starting a new file section
+            if line.startswith('diff --git'):
+                # Check if this is our target file
+                if file_path in line:
+                    in_target_file = True
+                else:
+                    in_target_file = False
+                continue
+
+            # Skip if we're not in the target file
+            if not in_target_file:
+                continue
+
+            # Parse hunk headers
             if line.startswith('@@'):
-                match = re.match(r'@@ -(\d+),?\d* \+(\d+),?\d* @@', line)
+                match = re.match(r'@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@', line)
                 if match:
-                    current_line = int(match.group(2))
-            elif line.startswith(('+', '-', ' ')) and current_line is not None:
-                if abs(current_line - line_number) <= 2:
+                    new_start = int(match.group(3))
+                    current_line = new_start
+                continue
+
+            # Process diff lines
+            if current_line is not None and line.startswith(('+', '-', ' ')):
+                # Check if this line is within our context window
+                if abs(current_line - line_number) <= context_window:
                     snippet.append(line)
-                if line.startswith('+'):
+
+                # If this is an added line, increment the line number
+                if line.startswith('+') and not line.startswith('+++'):
                     if current_line == line_number:
+                        # Found our target line, we can return the snippet
+                        result = '\n'.join(snippet)
                         print(
                             f"Snippet extraction completed in {time.time() - start_time:.2f} seconds")
-                        return '\n'.join(snippet)
+                        return result
                     current_line += 1
                 elif line.startswith(' '):
+                    # Context line
                     current_line += 1
+                # Note: deleted lines (starting with '-') don't increment the new line number
+
     except Exception as e:
         print(
             f"Error extracting snippet for {file_path}:{line_number}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return ""
+
+    # If we didn't find the exact line, return what we have
+    result = '\n'.join(snippet) if snippet else ""
     print(
         f"Snippet extraction completed in {time.time() - start_time:.2f} seconds")
-    return '\n'.join(snippet) if snippet else ""
+    return result
 
 
 def review_code(diff):
@@ -226,14 +311,32 @@ def review_code(diff):
         rule_based_items = rule_based_review(file_path, added_lines)
         final_results.extend(rule_based_items)
 
-        # 3️⃣ Run LLM review
+        # 3️⃣ Run LLM review on changed lines only
+        added_text = added_text_by_file.get(file_path, "")
+        if not added_text.strip():
+            print(f"No added content found for {file_path}")
+            continue
+
         try:
+            # Get context around changed lines for better review
             print(f"Reading file {file_path}...")
             with open(file_path, "r", encoding="utf-8") as f:
-                full_code = f.read()
-            if len(full_code) > 10000:
-                print(f"File {file_path} too large, truncating...")
-                full_code = full_code[:10000]
+                file_lines = f.readlines()
+
+            # Create focused content for review (changed lines + context)
+            review_content = []
+            for line_num in added_lines:
+                # Add context lines around each changed line
+                start_line = max(0, line_num - 5)
+                end_line = min(len(file_lines), line_num + 5)
+
+                for i in range(start_line, end_line):
+                    line_content = file_lines[i].rstrip()
+                    marker = ">>> NEW" if (i + 1) in added_lines else "    "
+                    review_content.append(f"{i+1:4d} {marker} {line_content}")
+
+            focused_content = '\n'.join(review_content)
+
         except Exception as e:
             print(f"Failed to read {file_path}: {str(e)}")
             final_results.append({
@@ -247,18 +350,23 @@ def review_code(diff):
         ext = os.path.splitext(file_path)[1]
         language = "Python" if ext == ".py" else "JavaScript/React" if ext in (
             ".js", ".jsx", ".ts", ".tsx") else "Unknown"
+
         prompt = (
-            f"You are an expert {language} code reviewer. Review the following file for:\n"
-            "- Syntax errors\n"
-            "- Logical bugs (boundary conditions, off-by-one, wrong variables)\n"
+            f"You are an expert {language} code reviewer. Review ONLY the lines marked with '>>> NEW' in the following code.\n"
+            f"Focus on these specific concerns for the NEW lines:\n"
+            "- Syntax errors and typos\n"
+            "- Logic bugs and potential runtime errors\n"
+            "- Security vulnerabilities\n"
             "- Performance issues\n"
-            "- Security concerns (secrets, injection, unsafe code)\n"
-            "- Maintainability and readability\n\n"
-            f"File: {file_path}\n\n"
-            f"```{full_code}```\n\n"
-            "Return ONLY a valid JSON array with no extra text. Each object must have: "
-            '{"file": "relative/path", "line": <line_number>, "snippet": "<code snippet>", "comment": "specific suggestion"}. '
-            "Ensure the response is valid JSON with double quotes and no markdown."
+            "- Code quality and best practices\n\n"
+            f"File: {file_path}\n"
+            f"Lines to review: {added_lines}\n\n"
+            f"Code with context (focus on lines marked '>>> NEW'):\n"
+            f"```{language.lower()}\n{focused_content}\n```\n\n"
+            "Return ONLY a valid JSON array with no markdown or extra text. For each issue found on NEW lines, create an object with:\n"
+            '{"file": "' + file_path +
+            '", "line": <actual_line_number>, "snippet": "", "comment": "Brief, specific suggestion for improvement"}\n'
+            "Only include issues for lines marked '>>> NEW'. Respond with [] if no issues found."
         )
 
         try:
@@ -270,27 +378,41 @@ def review_code(diff):
             print(f"Raw LLM output for {file_path}: {raw_text[:200]}...")
 
             items = safe_extract_json(raw_text)
-            for item in items:
-                if isinstance(item.get("line"), str):
-                    try:
-                        item["line"] = int(item["line"])
-                    except ValueError:
-                        item["line"] = 1
-                if item.get("file") == file_path and item.get("line"):
-                    snippet = extract_snippet(diff, item["line"], file_path)
-                    item["snippet"] = snippet
-                    item["comment"] = item.get(
-                        "comment", "") + "\n\n**Resolve:** Mark as resolved in GitHub UI"
-                final_results.append(item)
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+
+                    # Ensure line number is an integer
+                    line_num = item.get("line")
+                    if isinstance(line_num, str):
+                        try:
+                            line_num = int(line_num)
+                        except ValueError:
+                            continue
+                    elif not isinstance(line_num, int):
+                        continue
+
+                    # Only include comments for lines that were actually added
+                    if line_num in added_lines:
+                        # Extract relevant snippet from the diff
+                        snippet = extract_snippet(diff, line_num, file_path)
+
+                        # Create a well-formatted review comment
+                        comment = item.get("comment", "").strip()
+                        if comment:
+                            final_results.append({
+                                "file": file_path,
+                                "line": line_num,
+                                "snippet": snippet,
+                                "comment": comment + "\n\n**Resolve:** Mark as resolved in GitHub UI"
+                            })
+                            print(
+                                f"Added review comment for {file_path}:{line_num}")
+
             if not items:
                 print(
                     f"LLM produced empty/invalid JSON for {file_path}: {raw_text[:200]}...")
-                final_results.append({
-                    "file": file_path,
-                    "line": 1,
-                    "snippet": "",
-                    "comment": f"No specific AI comments generated.\n\n**Resolve:** Mark as resolved in GitHub UI"
-                })
         except OllamaError as e:
             print(f"LLM review failed for {file_path}: {str(e)}")
             final_results.append({
@@ -337,24 +459,38 @@ def save_review_results(results):
 def main():
     print("Starting main...")
     start_time = time.time()
+    diff = ""
+
     try:
         if len(sys.argv) > 1 and sys.argv[1] == '--github':
+            # Running in GitHub Actions
             diff = os.environ.get('PR_DIFF', '')
             print(
-                f"PR_DIFF from GitHub Actions: {diff[:200] if diff else 'Empty'}")
+                f"PR_DIFF from environment: {len(diff) if diff else 0} characters")
+
             if not diff:
-                print(
-                    "PR_DIFF is empty, attempting to fetch diff from GitHub context...")
-                repo = git.Repo('.')
-                diff = repo.git.diff('origin/main...HEAD')
-                print(f"Fetched diff: {diff[:200] if diff else 'Empty'}")
+                print("PR_DIFF is empty, attempting to fetch diff directly...")
+                try:
+                    repo = git.Repo('.')
+                    # Try different diff approaches
+                    diff = repo.git.diff('origin/main...HEAD')
+                    if not diff:
+                        diff = repo.git.diff('HEAD~1')
+                    print(f"Fetched diff: {len(diff)} characters")
+                except Exception as git_e:
+                    print(f"Git diff failed: {str(git_e)}")
         else:
+            # Running locally
+            print("Running in local mode...")
             try:
                 repo = git.Repo('.')
+                # For local development, compare against main
                 diff = repo.git.diff('main')
-                print("Using local git diff")
+                if not diff:
+                    diff = repo.git.diff('HEAD~1')
+                print(f"Local diff: {len(diff)} characters")
             except Exception as e:
-                print(f"Error getting diff: {str(e)}")
+                print(f"Error getting local diff: {str(e)}")
                 save_review_results([{
                     "file": "unknown",
                     "line": 1,
@@ -362,8 +498,9 @@ def main():
                     "comment": f"Error getting diff: {str(e)}\n\n**Resolve:** Mark as resolved in GitHub UI"
                 }])
                 return
+
     except Exception as e:
-        print(f"Error in main: {str(e)}")
+        print(f"Error in main setup: {str(e)}")
         save_review_results([{
             "file": "unknown",
             "line": 1,
@@ -372,17 +509,24 @@ def main():
         }])
         return
 
-    if not diff:
-        print("No changes detected.")
+    if not diff or len(diff.strip()) == 0:
+        print("No changes detected in diff.")
         save_review_results([{
-            "file": "unknown",
+            "file": "No changes",
             "line": 1,
             "snippet": "",
-            "comment": "No changes detected.\n\n**Resolve:** Mark as resolved in GitHub UI"
+            "comment": "No changes detected in this PR.\n\n**Resolve:** Mark as resolved in GitHub UI"
         }])
         return
 
+    print(f"Processing diff with {len(diff)} characters...")
     results = review_code(diff)
+
+    print(f"Review completed with {len(results)} comments")
+    for result in results:
+        print(
+            f"  - {result.get('file', 'unknown')}:{result.get('line', 1)} - {result.get('comment', '')[:100]}...")
+
     save_review_results(results)
     print(json.dumps(results, indent=2))
     print(f"Main completed in {time.time() - start_time:.2f} seconds")

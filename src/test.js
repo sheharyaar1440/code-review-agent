@@ -1,6 +1,6 @@
 import React from "react";
 
-const testabc = (asfasdf) => {
+const y = (asfasdf) => {
   return <div>test1</div>;
 };
 
