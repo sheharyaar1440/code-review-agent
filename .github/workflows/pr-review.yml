@@ -30,27 +30,61 @@ jobs:
       - name: Install and start Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh || { echo "Ollama install failed"; exit 1; }
+          if lsof -i :11434; then
+            echo "Port 11434 in use, attempting to free it..."
+            kill -9 $(lsof -t -i :11434) || { echo "Failed to kill process on port 11434"; exit 1; }
+          fi
           ollama serve &
-          sleep 30
-          curl -sSf http://127.0.0.1:11434 || { echo "Ollama server not running"; exit 1; }
+          echo "Waiting for Ollama to start..."
+          for i in {1..30}; do
+            if curl -sSf http://127.0.0.1:11434 >/dev/null 2>&1; then
+              echo "Ollama is ready!"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 3
+          done
+          curl -sSf http://127.0.0.1:11434 || { echo "Ollama server not running after 90s"; exit 1; }
 
       - name: Pull Code Llama Model
         run: |
           ollama pull codellama:7b-instruct || { echo "Model pull failed"; exit 1; }
 
       - name: Get PR Diff
-        id: get-diff
+        id: pr_diff
         run: |
-          git fetch origin
-          DIFF=$(git diff origin/${{ github.event.pull_request.base.ref }}...${{ github.sha }})
-          {
-            echo "PR_DIFF<<EOF"
-            echo "$DIFF"
-            echo "EOF"
-          } >> "$GITHUB_ENV"
+          echo "Fetching PR diff..."
+          git fetch origin main
+          DIFF=$(git diff origin/main...HEAD)
+          echo "PR_DIFF<<EOF" >> $GITHUB_ENV
+          echo "$DIFF" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "Diff size: $(echo "$DIFF" | wc -l) lines"
+
+      - name: Debug PR Diff
+        run: |
+          echo "PR_DIFF content (first 30 lines):"
+          echo "$PR_DIFF" | head -n 30
 
       - name: Run Code Review
-        run: python review_pr.py --github > review.json
+        run: python review_pr.py --github
+        timeout-minutes: 8
+        env:
+          PR_DIFF: ${{ env.PR_DIFF }}
+
+      - name: Debug Review Content
+        run: |
+          echo "Review content:"
+          if [ -f review.json ]; then
+            echo "review.json exists, size: $(wc -c < review.json) bytes"
+            echo "First 50 lines of review.json:"
+            head -n 50 review.json
+            echo "JSON structure check:"
+            python -c "import json; data=json.load(open('review.json')); print(f'Valid JSON with {len(data)} items')" || echo "Invalid JSON"
+          else
+            echo "No review.json found"
+            ls -la
+          fi
 
       - name: Post Inline Review Comments
         uses: actions/github-script@v7
@@ -67,7 +101,7 @@ jobs:
             try {
               review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
             } catch (e) {
-              core.warning('Failed to parse review.json; skipping inline comments');
+              core.warning(`Failed to parse review.json: ${e.message}`);
               review = [];
             }
 
@@ -85,18 +119,49 @@ jobs:
               return allowedExts.some(ext => p.endsWith(ext));
             };
             const changed = new Set(files.map(f => f.filename).filter(isReviewable));
+            console.log(`Found ${changed.size} reviewable files: ${Array.from(changed).join(', ')}`);
 
             let posted = 0;
+            let failed = 0;
+
+            // Process each review comment
             for (const item of review) {
               const file = item.file;
               const line = Number(item.line);
-              const body = String(item.comment || '').trim();
+              const snippet = item.snippet || "";
+              let body = (item.comment || "").trim();
+              
+              console.log(`Processing review item: ${file}:${line} - "${body.substring(0, 50)}..."`);
+              
+              // Skip items that can't be posted as inline comments
+              if (!file) {
+                console.log(`Skipping item: no file specified`);
+                continue;
+              }
+              
+              if (!changed.has(file)) {
+                console.log(`Skipping ${file}: not in changed files list`);
+                console.log(`Available files: ${Array.from(changed).join(', ')}`);
+                continue;
+              }
+              
+              if (!Number.isInteger(line) || line <= 0) {
+                console.log(`Skipping ${file}:${line}: invalid line number`);
+                continue;
+              }
+              
+              if (!body) {
+                console.log(`Skipping ${file}:${line}: empty comment`);
+                continue;
+              }
 
-              if (!file || !changed.has(file)) continue;
-              if (!Number.isInteger(line) || line <= 0) continue;
-              if (!body || body.toLowerCase().startsWith('fatal error:') || body.toLowerCase().startsWith('error:')) continue;
+              // Add diff context if available and not already formatted
+              if (snippet && !body.includes('Code Context:')) {
+                body = `**Code Context:**\n\`\`\`diff\n${snippet}\n\`\`\`\n\n${body}`;
+              }
 
               try {
+                console.log(`Attempting to post comment on ${file}:${line}`);
                 await github.rest.pulls.createReviewComment({
                   owner,
                   repo,
@@ -108,11 +173,20 @@ jobs:
                   body
                 });
                 posted++;
+                console.log(`✅ Successfully posted inline comment for ${file}:${line}`);
               } catch (e) {
+                failed++;
+                console.error(`❌ Failed to post inline comment for ${file}:${line} - ${e.message}`);
+                console.error(`Error details:`, e);
                 core.warning(`Failed to post inline comment for ${file}:${line} - ${e.message}`);
+                
+                // Try to understand why it failed
+                if (e.message.includes('line')) {
+                  console.log(`Line ${line} may not be part of the diff for ${file}`);
+                }
               }
             }
-            core.info(`Posted ${posted} inline review comments.`);
+            core.info(`Posted ${posted} inline review comments, ${failed} failed.`);
 
       - name: Post Review Summary
         uses: actions/github-script@v7
@@ -120,26 +194,86 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
-            let body = '';
+
             try {
               const review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
+              
               if (Array.isArray(review) && review.length > 0) {
-                body += 'AI Review findings:\n\n';
-                for (const item of review) {
-                  const file = item.file || 'UNKNOWN';
-                  const line = item.line || 1;
-                  const comment = item.comment || '';
-                  body += `- ${file}:${line} - ${comment}\n`;
+                // Count how many inline comments vs summary items
+                const inlineComments = review.filter(item => 
+                  item.file && 
+                  item.file !== 'unknown' && 
+                  item.file !== 'excluded' && 
+                  item.file !== 'review_completed' &&
+                  item.file !== 'ollama_connection' &&
+                  Number.isInteger(Number(item.line)) && 
+                  Number(item.line) > 0
+                );
+                
+                const summaryItems = review.filter(item => 
+                  !item.file || 
+                  item.file === 'unknown' || 
+                  item.file === 'excluded' || 
+                  item.file === 'review_completed' ||
+                  item.file === 'ollama_connection' ||
+                  !Number.isInteger(Number(item.line)) || 
+                  Number(item.line) <= 0
+                );
+                
+                console.log(`Found ${inlineComments.length} inline comments and ${summaryItems.length} summary items`);
+                
+                // Only post summary if there are summary items or if inline comments failed
+                if (summaryItems.length > 0) {
+                  let body = '### 🤖 AI Code Review Summary\n\n';
+                  
+                  if (inlineComments.length > 0) {
+                    body += `✅ Posted ${inlineComments.length} inline review comments on specific code lines.\n\n`;
+                  }
+                  
+                  if (summaryItems.length > 0) {
+                    body += '📋 **Additional Notes:**\n\n';
+                    for (const item of summaryItems) {
+                      const comment = (item.comment || '').replace(/---[\s\S]*$/, '').trim();
+                      body += `- ${comment}\n`;
+                    }
+                  }
+                  
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.issue.number,
+                    body
+                  });
+                } else if (inlineComments.length > 0) {
+                  // Just post a simple summary that inline comments were added
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.issue.number,
+                    body: `### 🤖 AI Code Review Complete\n\n✅ Posted ${inlineComments.length} inline review comments on specific lines of code. Please review each comment and mark as resolved when addressed.`
+                  });
+                } else {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.issue.number,
+                    body: '### 🤖 AI Code Review Complete\n\n✅ No issues found in the code changes.'
+                  });
                 }
               } else {
-                body = 'No actionable AI review comments found.';
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: '### 🤖 AI Code Review\n\n⚠️ No review comments were generated.'
+                });
               }
             } catch (e) {
-              body = 'AI review failed to produce valid JSON.';
+              core.warning(`AI review summary failed: ${e.message}`);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `### 🤖 AI Code Review\n\n❌ Review failed: ${e.message}`
+              });
             }
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body
-            });
