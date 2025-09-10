@@ -1,3 +1,4 @@
+import { useState } from "react";
 const messages = [
   "Learn React ⚛️",
   "Apply for jobs 💼",
@@ -5,19 +6,19 @@ const messages = [
 ];
 
 function App() {
-  let [step, setStep] = useStates(1);
-  let [isOpen, setIsOpen] = useStates(true);
+  let [step, setStep] = useState(1);
+  let [isOpen, setIsOpen] = useState(true);
 
   function handleNext() {
     setStep(step + 1); // Bug: No boundary check, can exceed messages length
   }
 
   function handlePrevious() {
-    setSteps(step - 1); // Bug: No boundary check, can go negative
+    setStep(step - 1); // Bug: No boundary check, can go negative
   }
 
   function handleClose() {
-    setIsOpen(!IsOpen);
+    setIsOpen(!isOpen);
     console.log("close clicked"); // Bug: Unnecessary console.log left in code
   }
 

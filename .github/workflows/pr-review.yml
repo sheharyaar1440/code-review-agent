@@ -2,31 +2,22 @@ name: AI PR Review
 
 on:
   pull_request:
+    branches:
+      - main
     types: [opened, synchronize, reopened]
 
 jobs:
   review:
     runs-on: ubuntu-latest
     permissions:
-      issues: write
       pull-requests: write
       contents: read
+      issues: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Install Ollama
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh || { echo "Ollama install failed"; exit 1; }
-          ollama serve &
-          sleep 30
-          curl http://127.0.0.1:11434 || { echo "Ollama server not running"; exit 1; }
-
-      - name: Pull Code Llama Model
-        run: |
-          ollama pull codellama:7b-instruct || { echo "Model pull failed"; exit 1; }
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,136 +27,119 @@ jobs:
       - name: Install dependencies
         run: pip install ollama gitpython
 
+      - name: Install and start Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh || { echo "Ollama install failed"; exit 1; }
+          ollama serve &
+          sleep 30
+          curl -sSf http://127.0.0.1:11434 || { echo "Ollama server not running"; exit 1; }
+
+      - name: Pull Code Llama Model
+        run: |
+          ollama pull codellama:7b-instruct || { echo "Model pull failed"; exit 1; }
+
       - name: Get PR Diff
         id: get-diff
         run: |
           git fetch origin
-        DIFF=$(git diff origin/main...HEAD)
-         echo "PR_DIFF<<EOF" >> $GITHUB_ENV
-         echo "$DIFF" >> $GITHUB_ENV
-         echo "EOF" >> $GITHUB_ENV
+          DIFF=$(git diff origin/${{ github.event.pull_request.base.ref }}...${{ github.sha }})
+          {
+            echo "PR_DIFF<<EOF"
+            echo "$DIFF"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
 
-         - name: Run Code Review
-        id: run-review
-        run: |
-          python review_pr.py --github > review.json
+      - name: Run Code Review
+        run: python review_pr.py --github > review.json
 
-      - name: Post Review
+      - name: Post Inline Review Comments
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const review = JSON.parse(fs.readFileSync('review.json', 'utf8'));
+            const path = require('path');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.issue.number;
+            const headSha = context.payload.pull_request.head.sha;
 
-            const comments = [];
+            let review;
+            try {
+              review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
+            } catch (e) {
+              core.warning('Failed to parse review.json; skipping inline comments');
+              review = [];
+            }
 
+            if (!Array.isArray(review)) {
+              core.warning('review.json is not an array; skipping inline comments');
+              review = [];
+            }
+
+            const { data: files } = await github.rest.pulls.listFiles({ owner, repo, pull_number, per_page: 100 });
+            const isReviewable = (p) => {
+              if (!p) return false;
+              const excludedPrefixes = ['.github/','.husky/','scripts/','config/','node_modules/','public/','__tests__/','.vscode/','.idea/','.git/'];
+              if (excludedPrefixes.some(pre => p.startsWith(pre))) return false;
+              const allowedExts = ['.js','.jsx','.ts','.tsx','.mjs','.cjs','.vue','.svelte','.py','.rb','.php','.go','.rs','.java','.kt','.kts','.scala','.cs','.cshtml','.vb','.fs','.swift','.c','.cc','.cxx','.cpp','.h','.hpp','.hh','.m','.mm','.sql','.ps1','.sh'];
+              return allowedExts.some(ext => p.endsWith(ext));
+            };
+            const changed = new Set(files.map(f => f.filename).filter(isReviewable));
+
+            let posted = 0;
             for (const item of review) {
-              if (!item.file || !item.line || !item.comment) continue;
+              const file = item.file;
+              const line = Number(item.line);
+              const body = String(item.comment || '').trim();
 
-              comments.push({
-                path: item.file,
-                line: item.line,
-                side: "RIGHT",
-                body: item.comment
-              });
-            }
+              if (!file || !changed.has(file)) continue;
+              if (!Number.isInteger(line) || line <= 0) continue;
+              if (!body || body.toLowerCase().startsWith('fatal error:') || body.toLowerCase().startsWith('error:')) continue;
 
-            if (comments.length > 0) {
-              await github.rest.pulls.createReview({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: context.issue.number,
-                event: "COMMENT",
-                comments
-              });
-            } else {
-              await github.rest.pulls.createReview({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: context.issue.number,
-                body: "No actionable AI review comments found.",
-                event: "COMMENT"
-              });
-            }
-
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const review = fs.readFileSync('review.md', 'utf8');
-            console.log('Review content:', review); // Debug
-            const lines = review.split('\n');
-            let currentLineNumber = null;
-            let currentComment = '';
-            let currentSnippet = '';
-            let inSnippet = false;
-            // Assume App.js for simplicity; adjust dynamically if needed
-            const filePath = 'App.js';
-
-            for (let i = 0; i < lines.length; i++) {
-              const line = lines[i].trim();
-              console.log(`Processing line ${i}:`, line); // Debug
-              if (line.match(/^\*\*Line (\d+):\*\*$/)) {
-                if (currentLineNumber && currentComment) {
-                  console.log(`Posting comment for line ${currentLineNumber}:`, currentComment);
-                  try {
-                    await github.rest.pulls.createReviewComment({
-                      owner: context.repo.owner,
-                      repo: context.repo.repo,
-                      pull_number: context.issue.number,
-                      body: `${currentSnippet}\n\n${currentComment}\n\n**Resolve:** Mark as resolved in GitHub UI`,
-                      commit_id: context.payload.pull_request.head.sha,
-                      path: filePath,
-                      line: currentLineNumber
-                    });
-                  } catch (e) {
-                    console.error('Error posting comment:', e);
-                    throw e;
-                  }
-                }
-                currentLineNumber = parseInt(line.match(/^\*\*Line (\d+):\*\*$/)[1]);
-                currentComment = '';
-                currentSnippet = '';
-                inSnippet = false;
-              } else if (line === '```diff') {
-                inSnippet = true;
-                currentSnippet = line + '\n';
-              } else if (line === '```' && inSnippet) {
-                inSnippet = false;
-                currentSnippet += line + '\n';
-              } else if (inSnippet) {
-                currentSnippet += line + '\n';
-              } else if (line.startsWith('**Comment:** ')) {
-                currentComment = line.replace('**Comment:** ', '');
-              }
-            }
-            // Post the last comment
-            if (currentLineNumber && currentComment) {
-              console.log(`Posting final comment for line ${currentLineNumber}:`, currentComment);
               try {
                 await github.rest.pulls.createReviewComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: context.issue.number,
-                  body: `${currentSnippet}\n\n${currentComment}\n\n**Resolve:** Mark as resolved in GitHub UI`,
-                  commit_id: context.payload.pull_request.head.sha,
-                  path: filePath,
-                  line: currentLineNumber
+                  owner,
+                  repo,
+                  pull_number,
+                  commit_id: headSha,
+                  path: file,
+                  line,
+                  side: 'RIGHT',
+                  body
                 });
+                posted++;
               } catch (e) {
-                console.error('Error posting final comment:', e);
-                throw e;
+                core.warning(`Failed to post inline comment for ${file}:${line} - ${e.message}`);
               }
             }
-            // Post general review summary
+            core.info(`Posted ${posted} inline review comments.`);
+
+      - name: Post Review Summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            let body = '';
             try {
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: review
-              });
+              const review = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'review.json'), 'utf8'));
+              if (Array.isArray(review) && review.length > 0) {
+                body += 'AI Review findings:\n\n';
+                for (const item of review) {
+                  const file = item.file || 'UNKNOWN';
+                  const line = item.line || 1;
+                  const comment = item.comment || '';
+                  body += `- ${file}:${line} - ${comment}\n`;
+                }
+              } else {
+                body = 'No actionable AI review comments found.';
+              }
             } catch (e) {
-              console.error('Error posting summary comment:', e);
-              throw e;
+              body = 'AI review failed to produce valid JSON.';
             }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
