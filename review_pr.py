@@ -8,7 +8,6 @@ import git
 import time
 try:
     from ollama import Client
-    # Attempt to import OllamaError, fallback to Exception if not available
     try:
         from ollama import OllamaError
     except ImportError:
@@ -32,12 +31,13 @@ def parse_unified_diff(diff):
         if len(diff) > 100000:
             print("Diff too large, truncating...")
             diff = diff[:100000]
+        print(f"Diff content (first 50 lines):\n{diff.split('\n')[:50]}")
         for line in diff.split('\n'):
             if line.startswith('diff --git'):
                 if current_file and current_lines:
                     added_lines_by_file[current_file] = current_lines
                     added_text_by_file[current_file] = '\n'.join(current_text)
-                current_file = line.split('b/')[-1]
+                current_file = line.split('b/')[-1].strip()
                 current_lines = []
                 current_text = []
             elif line.startswith('@@'):
@@ -56,7 +56,8 @@ def parse_unified_diff(diff):
     except Exception as e:
         print(f"Error parsing diff: {str(e)}")
         return {}, {}
-    print(f"Diff parsing completed in {time.time() - start_time:.2f} seconds")
+    print(
+        f"Diff parsing completed in {time.time() - start_time:.2f} seconds with {len(added_lines_by_file)} files")
     return added_lines_by_file, added_text_by_file
 
 
@@ -208,7 +209,7 @@ def review_code(diff):
             "file": "unknown",
             "line": 1,
             "snippet": "",
-            "comment": "No files with changes detected.\n\n**Resolve:** Mark as resolved in GitHub UI"
+            "comment": "No changes detected.\n\n**Resolve:** Mark as resolved in GitHub UI"
         })
         print(
             f"Code review completed in {time.time() - start_time:.2f} seconds")
@@ -339,7 +340,14 @@ def main():
     try:
         if len(sys.argv) > 1 and sys.argv[1] == '--github':
             diff = os.environ.get('PR_DIFF', '')
-            print("Using PR_DIFF from GitHub Actions")
+            print(
+                f"PR_DIFF from GitHub Actions: {diff[:200] if diff else 'Empty'}")
+            if not diff:
+                print(
+                    "PR_DIFF is empty, attempting to fetch diff from GitHub context...")
+                repo = git.Repo('.')
+                diff = repo.git.diff('origin/main...HEAD')
+                print(f"Fetched diff: {diff[:200] if diff else 'Empty'}")
         else:
             try:
                 repo = git.Repo('.')
